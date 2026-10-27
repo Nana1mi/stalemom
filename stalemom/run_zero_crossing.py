@@ -2,7 +2,7 @@
 Find the exact zero-crossing point rho* where truncation bias flips from costly (positive)
 to damping/beneficial (negative).
 Grid:
-  rho_lam in {0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0}
+  rho_lam in {0.1, 0.25, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0}
   k in {4, 8, 12, 16}
   eta_lam in {0.03, 0.1, 0.3}
 """
@@ -11,7 +11,7 @@ import csv
 import itertools
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 from stalemom.sim import simulate
@@ -84,6 +84,8 @@ def run_condition(task: dict) -> dict:
     }
     res_tis = simulate(cfg_tis)
     a_t_tis_runs = np.mean(res_tis["gap"][:, 1:], axis=1)
+    mean_kl_pq = float(np.mean(res_tis["kl_pq"]))
+    mean_trunc_rate = float(np.mean(res_tis["trunc_rate"]))
 
     # 4. TIS Debiased
     cfg_deb = {
@@ -103,6 +105,7 @@ def run_condition(task: dict) -> dict:
     diff_runs = a_t_tis_runs - a_t_deb_runs
     stoch_effect = float(np.mean(diff_runs))
     stoch_se = float(np.std(diff_runs, ddof=1) / np.sqrt(R))
+    t_stat = float(stoch_effect / stoch_se) if stoch_se > 1e-12 else 0.0
 
     return {
         "k": k,
@@ -112,6 +115,9 @@ def run_condition(task: dict) -> dict:
         "det_effect": det_effect,
         "stoch_effect": stoch_effect,
         "stoch_se": stoch_se,
+        "t_stat": t_stat,
+        "mean_kl_pq": mean_kl_pq,
+        "mean_trunc_rate": mean_trunc_rate,
         "a_t_exact": a_t_exact,
         "a_t_mean": a_t_mean,
         "a_t_tis": float(np.mean(a_t_tis_runs)),
@@ -119,17 +125,37 @@ def run_condition(task: dict) -> dict:
     }
 
 
-def find_zero_crossing(xs: list[float], ys: list[float]) -> float:
-    """Find zero crossing using linear interpolation between sign change."""
-    for i in range(len(ys) - 1):
-        y1, y2 = ys[i], ys[i + 1]
-        x1, x2 = xs[i], xs[i + 1]
+def find_significant_zero_crossing(items: list[dict]) -> tuple[float, str]:
+    """Find zero crossing using linear interpolation, but only if both sides have |t| > 3.
+    Returns (rho_star, note).
+    """
+    items_sorted = sorted(items, key=lambda r: r["rho_lam"])
+    t_stats = [r["t_stat"] for r in items_sorted]
+    rhos = [r["rho_lam"] for r in items_sorted]
+    effects = [r["stoch_effect"] for r in items_sorted]
+
+    has_sig_pos = any(t > 3.0 for t in t_stats)
+    has_sig_neg = any(t < -3.0 for t in t_stats)
+
+    if not has_sig_pos and not has_sig_neg:
+        return float("nan"), "No significant effect (|t| <= 3 throughout)"
+    if has_sig_pos and not has_sig_neg:
+        return float("nan"), "Entirely positive (costly) across all tested rho"
+    if has_sig_neg and not has_sig_pos:
+        return float("nan"), "Entirely negative (beneficial/damping) across tested rho"
+
+    # Both positive and negative sides are significant (|t| > 3)
+    for i in range(len(effects) - 1):
+        y1, y2 = effects[i], effects[i + 1]
+        x1, x2 = rhos[i], rhos[i + 1]
         if (y1 >= 0 and y2 <= 0) or (y1 <= 0 and y2 >= 0):
             if abs(y2 - y1) < 1e-12:
-                return x1
-            # Linear interpolation: x = x1 + (0 - y1) * (x2 - x1) / (y2 - y1)
-            return float(x1 - y1 * (x2 - x1) / (y2 - y1))
-    return float("nan")
+                return x1, "Significant sign flip"
+            # Linear interpolation on rho
+            x_cross = float(x1 - y1 * (x2 - x1) / (y2 - y1))
+            return x_cross, "Significant sign flip"
+
+    return float("nan"), "No sign crossing observed"
 
 
 def main():
@@ -141,13 +167,13 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    rho_lams = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+    rho_lams = [0.1, 0.25, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0]
     ks = [4, 8, 12, 16]
     eta_lams = [0.03, 0.1, 0.3]
 
     tasks = []
     for k, eta_lam, rho_lam in itertools.product(ks, eta_lams, rho_lams):
-        if rho_lam < eta_lam:
+        if rho_lam < eta_lam - 1e-6:
             continue
         tasks.append({
             "k": k,
@@ -177,24 +203,19 @@ def main():
 
     # Compute zero-crossings per (k, eta_lam)
     crossings = []
-    print("\n=== ZERO-CROSSING ESTIMATES ===")
+    print("\n=== ROBUST ZERO-CROSSING ESTIMATES (|t| > 3 on both sides) ===")
     for (k, eta_lam), group in itertools.groupby(results, key=lambda r: (r["k"], r["eta_lam"])):
         items = list(group)
-        rhos = [r["rho_lam"] for r in items]
-        det_ys = [r["det_effect"] for r in items]
-        stoch_ys = [r["stoch_effect"] for r in items]
-
-        rho_det_zero = find_zero_crossing(rhos, det_ys)
-        rho_stoch_zero = find_zero_crossing(rhos, stoch_ys)
-
+        rho_zero, note = find_significant_zero_crossing(items)
         cross_info = {
             "k": k,
             "eta_lam": eta_lam,
-            "rho_star_det": rho_det_zero,
-            "rho_star_stoch": rho_stoch_zero,
+            "rho_star_stoch": rho_zero,
+            "status": note,
         }
         crossings.append(cross_info)
-        print(f"k={k:2d}, eta_lam={eta_lam:.2f} | rho* (det) = {rho_det_zero:.3f}, rho* (stoch) = {rho_stoch_zero:.3f}")
+        rho_str = f"{rho_zero:.3f}" if not np.isnan(rho_zero) else "N/A"
+        print(f"k={k:2d}, eta_lam={eta_lam:.2f} | rho* = {rho_str:>6} ({note})")
 
     cross_csv = os.path.join(args.out, "zero_crossing_points.csv")
     with open(cross_csv, "w", newline="", encoding="utf-8") as f:

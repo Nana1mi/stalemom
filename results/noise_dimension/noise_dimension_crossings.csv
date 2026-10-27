@@ -1,0 +1,10 @@
+dimension,param_name,param_val,rho_star,status
+batch_size,B,4,nan,Entirely negative (beneficial/damping) across tested rho
+batch_size,B,8,nan,Entirely negative (beneficial/damping) across tested rho
+batch_size,B,16,0.40793055502063946,Significant sign flip
+batch_size,B,32,1.0258756136705744,Significant sign flip
+batch_size,B,64,1.1958752824652379,Significant sign flip
+batch_size,B,128,1.2178694133136525,Significant sign flip
+n_good,n_good,2,1.0258756136705744,Significant sign flip
+n_good,n_good,3,0.6769051461469239,Significant sign flip
+n_good,n_good,5,nan,Entirely negative (beneficial/damping) across tested rho

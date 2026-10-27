@@ -1,13 +1,13 @@
-k,eta_lam,rho_star_det,rho_star_stoch
-4,0.03,0.1,0.9857356973554531
-4,0.1,1.257331923952259,0.6356608191216551
-4,0.3,1.1039854444697432,nan
-8,0.03,4.13810740956019,0.9608806281905262
-8,0.1,1.056655033207472,0.8286588360567857
-8,0.3,1.7204710456579269,nan
-12,0.03,1.4543378189596095,1.0206091396569859
-12,0.1,1.1254478273390989,0.8750778863984855
-12,0.3,3.479553892094575,nan
-16,0.03,1.2055994943385029,0.9862710435633155
-16,0.1,1.2801597201887505,1.0258756136705744
-16,0.3,7.95106804001136,nan
+k,eta_lam,rho_star_stoch,status
+4,0.03,nan,No significant effect (|t| <= 3 throughout)
+4,0.1,nan,Entirely negative (beneficial/damping) across tested rho
+4,0.3,nan,Entirely negative (beneficial/damping) across tested rho
+8,0.03,nan,Entirely positive (costly) across all tested rho
+8,0.1,0.8286588360567857,Significant sign flip
+8,0.3,nan,Entirely negative (beneficial/damping) across tested rho
+12,0.03,1.0206091396569859,Significant sign flip
+12,0.1,0.8750778863984855,Significant sign flip
+12,0.3,nan,Entirely negative (beneficial/damping) across tested rho
+16,0.03,0.9862710435633155,Significant sign flip
+16,0.1,1.0258756136705744,Significant sign flip
+16,0.3,nan,Entirely negative (beneficial/damping) across tested rho

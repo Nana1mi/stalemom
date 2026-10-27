@@ -51,6 +51,7 @@ def simulate(cfg: dict) -> dict:
     if c is not None:
         c = float(c)
     mismatch = cfg.get("mismatch", "lag")
+    gradient_type = cfg.get("gradient_type", "npg")
 
     R = int(run_cfg["R"])
     if estimator in ("exact", "tis_mean"):
@@ -168,12 +169,19 @@ def simulate(cfg: dict) -> dict:
                 logq_t = logp_cache[:, q_idx]
                 kl_pq[:, t] = np.sum(p_t * (logp_t - logq_t), axis=-1)
 
-        # Exact NPG direction: h(theta) = Pi [ r - lam * (log p_theta - log p_ref) ]
+        # Update direction: h(theta)
         v_h = r - lam * (logp_t - logp_ref)
-        h_t = project(v_h)
+        if gradient_type == "vanilla":
+            h_t = p_t * v_h - p_t * np.sum(p_t * v_h, axis=-1, keepdims=True)
+        else:
+            h_t = project(v_h)
 
         if estimator in ("tis", "tis_mean"):
-            b_t = tis_bias(p_t, q_t, r, c)
+            delta_r = r * (np.minimum(1.0, c * q_t / p_t) - 1.0)
+            if gradient_type == "vanilla":
+                b_t = p_t * delta_r - p_t * np.sum(p_t * delta_r, axis=-1, keepdims=True)
+            else:
+                b_t = project(delta_r)
         else:
             b_t = np.zeros_like(h_t)
 
@@ -188,13 +196,21 @@ def simulate(cfg: dict) -> dict:
         elif estimator == "onpolicy":
             counts = sample_counts(rng, p_t, B)
             rho_hat = reward_term("onpolicy", counts, p_t, q_t, r, c, B)
-            g_t = direction(rho_hat, logp_t, logp_ref, lam)
+            v_t = rho_hat - lam * (logp_t - logp_ref)
+            if gradient_type == "vanilla":
+                g_t = p_t * v_t - p_t * np.sum(p_t * v_t, axis=-1, keepdims=True)
+            else:
+                g_t = project(v_t)
             xi_t = g_t - h_t - b_t
             trunc_rate[:, t] = 0.0
         else:
             counts = sample_counts(rng, q_t, B)
             rho_hat = reward_term(estimator, counts, p_t, q_t, r, c, B)
-            g_t = direction(rho_hat, logp_t, logp_ref, lam)
+            v_t = rho_hat - lam * (logp_t - logp_ref)
+            if gradient_type == "vanilla":
+                g_t = p_t * v_t - p_t * np.sum(p_t * v_t, axis=-1, keepdims=True)
+            else:
+                g_t = project(v_t)
             xi_t = g_t - h_t - b_t
             if estimator == "tis":
                 trunc_rate[:, t] = truncation_rate(counts, p_t, q_t, c, B)

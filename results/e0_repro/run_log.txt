@@ -1,0 +1,8 @@
+Git commit: 0c3bbceaac02c53d1e3d97a7ed5d47fb921c99ac
+NumPy version: 2.2.6
+Experiment: E0-R Reproduction (Wang et al. 2026 §6.1)
+Total tasks: 16 (8 Ts x 2 inits)
+Runs per group: 20000
+Groups: No momentum, Fixed beta=0.9, Scaled beta=1-4eta (rho=0.25)
+Elapsed time: 781.44 s
+Diverged runs: 0

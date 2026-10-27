@@ -1,0 +1,7 @@
+Git commit: 0c3bbceaac02c53d1e3d97a7ed5d47fb921c99ac
+NumPy version: 2.2.6
+Total configurations: 54
+Runnable configurations: 54
+Skipped configurations: 0
+Configurations with diverged runs: 0
+Total elapsed time: 2.53 s

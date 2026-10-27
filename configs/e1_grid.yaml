@@ -1,0 +1,29 @@
+name: e1_grid
+problem:
+  K: 10
+  n_good: 2              # 前 n_good 个动作奖励为 1，其余为 0
+  lam: 1.0
+  init: random           # random | uniform
+  init_seed: 0           # 固定问题实例
+  init_scale: 1.0        # random 时 θ0 = init_scale * Π z，z~N(0,I)
+  ref: init              # 参考分布 = 初始策略
+run:
+  R: 20                  # 种子数（并行运行数）
+  seed: 12345
+  T: 512
+  B: 32
+  log_every: 1           # 标量指标每步记录；向量诊断每 diag_every 步记录
+  diag_every: 8
+sweep:                   # 笛卡尔积展开，非法组合跳过并记录
+  estimator: [is, tis]
+  k: [0, 2, 8, 16]
+  eta_lam: [0.001, 0.003, 0.01, 0.03, 0.1]   # 实际 η = eta_lam / lam
+  momentum:              # 二选一：rho_lam 或 beta_fixed
+    - {rho_lam: 0.0}
+    - {rho_lam: 0.05}
+    - {rho_lam: 0.1}
+    - {rho_lam: 0.25}
+    - {beta_fixed: 0.9}
+    - {beta_fixed: 0.999999}
+  c: [1.2, 1.5, 2.0]     # 仅对 tis 系列有效；is 只跑一次
+  mismatch: [lag]

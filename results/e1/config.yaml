@@ -1,0 +1,44 @@
+name: e1_grid
+problem:
+  K: 10
+  init: random
+  init_scale: 1.0
+  init_seed: 0
+  lam: 1.0
+  n_good: 2
+  ref: init
+run:
+  B: 32
+  R: 20
+  T: 512
+  diag_every: 8
+  log_every: 1
+  seed: 12345
+sweep:
+  c:
+  - 1.2
+  - 1.5
+  - 2.0
+  estimator:
+  - is
+  - tis
+  eta_lam:
+  - 0.001
+  - 0.003
+  - 0.01
+  - 0.03
+  - 0.1
+  k:
+  - 0
+  - 2
+  - 8
+  - 16
+  mismatch:
+  - lag
+  momentum:
+  - rho_lam: 0.0
+  - rho_lam: 0.05
+  - rho_lam: 0.1
+  - rho_lam: 0.25
+  - beta_fixed: 0.9
+  - beta_fixed: 0.999999

@@ -1,0 +1,13 @@
+name: e0_repro
+problem:
+  K: 10
+  n_good: 3
+  lam: 1.0
+  init_scale: 1.0
+  ref: init
+run:
+  R: 20000
+  B: 1
+  seed: 42
+  Ts: [32, 64, 128, 256, 512, 1024, 2048, 4096]
+  inits: [uniform, random]

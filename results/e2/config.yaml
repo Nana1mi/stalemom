@@ -1,0 +1,38 @@
+name: e2_paths
+problem:
+  K: 10
+  init: random
+  init_scale: 1.0
+  init_seed: 0
+  lam: 1.0
+  n_good: 2
+  ref: init
+run:
+  B: 32
+  R: 100
+  T: 512
+  diag_every: 8
+  log_every: 1
+  return_traj: true
+  seed: 12345
+sweep:
+  c:
+  - 1.5
+  estimator:
+  - exact
+  - is
+  - tis
+  - tis_mean
+  - tis_debiased
+  eta_lam:
+  - 0.01
+  - 0.03
+  k:
+  - 8
+  - 16
+  mismatch:
+  - lag
+  momentum:
+  - rho_lam: 0.0
+  - rho_lam: 0.25
+  - beta_fixed: 0.999999

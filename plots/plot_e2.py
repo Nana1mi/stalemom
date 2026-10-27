@@ -21,11 +21,13 @@ def plot_e2(summary_csv: str, results_dir: str, out_dir: str):
 
     valid_rows = [r for r in rows if r["skipped"] != "True" and r["skipped"] != True]
 
-    # Target settings for comparison: k=8, eta_lam=0.01, c=1.5
-    mom_settings = [
-        ("No momentum (rho=0)", lambda r: r["rho_lam"] != "" and abs(float(r["rho_lam"])) < 1e-5),
-        ("Scaled momentum (rho=0.25)", lambda r: r["rho_lam"] != "" and abs(float(r["rho_lam"]) - 0.25) < 1e-4),
-        ("Long memory (beta=1-1e-6)", lambda r: r["beta_fixed"] != "" and float(r["beta_fixed"]) > 0.99),
+    # Target settings: k=16, eta_lam=0.1, c=1.2
+    betas = [0.0, 0.6, 0.9, 0.99]
+    beta_labels = [
+        r"$\beta=0$ ($\rho=0.10$, safe)",
+        r"$\beta=0.6$ ($\rho=0.25$, boundary)",
+        r"$\beta=0.9$ ($\rho=1.0$, outside safe)",
+        r"$\beta=0.99$ ($\rho=10$, overshoot)",
     ]
 
     estimators = ["exact", "is", "tis_mean", "tis", "tis_debiased"]
@@ -37,24 +39,24 @@ def plot_e2(summary_csv: str, results_dir: str, out_dir: str):
         "tis_debiased": "#9467bd",
     }
     labels = {
-        "exact": "Exact NPG",
+        "exact": "Exact NPG (no noise, no bias)",
         "is": "Full IS (noise only)",
         "tis_mean": "TIS Mean (bias only)",
         "tis": "TIS (bias + noise)",
         "tis_debiased": "TIS Debiased (noise only)",
     }
 
-    # 1. 5 paths gap vs t curves faceted by momentum
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=150, sharey=True)
+    # 1. 5 paths gap vs t curves faceted by beta
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5), dpi=150, sharey=True)
 
-    for ax, (mom_title, mom_cond) in zip(axes, mom_settings):
+    for ax, b_val, b_label in zip(axes, betas, beta_labels):
         for est in estimators:
             matching = [
                 r for r in valid_rows
                 if r["estimator"] == est
-                and int(r["k"]) in (8, 0 if est in ("exact", "onpolicy") else 8)
-                and abs(float(r["eta_lam"]) - 0.01) < 1e-4
-                and mom_cond(r)
+                and int(r["k"]) in (16, 0 if est in ("exact", "onpolicy") else 16)
+                and abs(float(r["eta_lam"]) - 0.1) < 1e-4
+                and r["beta_fixed"] != "" and abs(float(r["beta_fixed"]) - b_val) < 1e-4
             ]
             if not matching:
                 continue
@@ -71,33 +73,83 @@ def plot_e2(summary_csv: str, results_dir: str, out_dir: str):
 
             line = ax.plot(t_axis, median_gap, color=colors[est], label=labels[est], lw=1.8)[0]
             if est not in ("exact", "tis_mean"):
-                ax.fill_between(t_axis, q25, q75, color=colors[est], alpha=0.12)
+                ax.fill_between(t_axis, q25, q75, color=colors[est], alpha=0.10)
 
-        ax.set_title(mom_title)
+        ax.set_title(b_label, fontsize=11)
         ax.set_xlabel("Step $t$")
         ax.grid(True, ls="--", alpha=0.5)
-        ax.legend(fontsize=9)
 
     axes[0].set_ylabel("Normalized Gap")
-    fig.suptitle(r"E2: Causal Debiasing Comparison Across 5 Paths ($k=8, \eta\lambda=0.01$)", fontsize=14, y=1.02)
+    axes[0].legend(fontsize=8, loc="upper right")
+    fig.suptitle(r"E2: Causal Debiasing Across 5 Paths ($k=16, \eta\lambda=0.1, c=1.2, R=200$)", fontsize=14, y=1.02)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "e2_paths_gap.png"), bbox_inches="tight")
     plt.close(fig)
     print("Saved E2 paths gap plot.")
 
-    # 2. Decomposition inner products vs t for TIS under long memory vs rho=0.25
+    # 2. Sign flip of truncation bias effect across beta
+    paired_csv = os.path.join(results_dir, "paired_summary.csv")
+    if os.path.exists(paired_csv):
+        p_rows = load_summary(paired_csv)
+        # Filter for k=16, eta_lam=0.1
+        sub_p = [
+            r for r in p_rows
+            if int(r["k"]) == 16 and abs(float(r["eta_lam"]) - 0.1) < 1e-4
+        ]
+        if sub_p:
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
+            b_vals = []
+            det_effects = []
+            stoch_effects = []
+            stoch_ses = []
+
+            for r in sub_p:
+                mom_str = r["momentum"]
+                if "beta_" in mom_str:
+                    b = float(mom_str.replace("beta_", ""))
+                    b_vals.append(b)
+                    det_effects.append(float(r["det_bias_effect"]))
+                    stoch_effects.append(float(r["stoch_bias_effect"]))
+                    stoch_ses.append(float(r["stoch_bias_se"]))
+
+            order = np.argsort(b_vals)
+            b_arr = np.array(b_vals)[order]
+            det_arr = np.array(det_effects)[order]
+            stoch_arr = np.array(stoch_effects)[order]
+            se_arr = np.array(stoch_ses)[order]
+
+            ax.axhline(0.0, color="black", ls="--", alpha=0.7)
+            ax.plot(b_arr, det_arr, "s--", color="#ff7f0e", label="Deterministic bias: tis_mean - exact")
+            ax.errorbar(b_arr, stoch_arr, yerr=se_arr, fmt="o-", color="#d62728", capsize=4,
+                        label=r"Stochastic paired bias: tis - tis_debiased ($\pm$SE)")
+
+            ax.axvspan(-0.05, 0.6, color="green", alpha=0.1, label=r"Safe region ($\rho \leq 0.25$)")
+            ax.axvspan(0.6, 1.05, color="red", alpha=0.1, label="Overshoot / outside safe region")
+
+            ax.set_xlabel(r"Momentum coefficient $\beta$")
+            ax.set_ylabel(r"Bias Effect on $A_T$ (positive = slower, negative = faster)")
+            ax.set_title(r"E2: Sign Flip of Truncation Bias Effect ($k=16, \eta\lambda=0.1, c=1.2$)")
+            ax.grid(True, ls="--", alpha=0.5)
+            ax.legend(fontsize=9)
+
+            fig.tight_layout()
+            fig.savefig(os.path.join(out_dir, "e2_bias_sign_flip.png"), bbox_inches="tight")
+            plt.close(fig)
+            print("Saved E2 bias sign flip plot.")
+
+    # 3. Decomposition inner products vs t for TIS under beta=0.6 vs beta=0.99
     fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
-    for ax_idx, (mom_title, mom_cond) in enumerate([
-        ("Scaled Momentum (rho=0.25)", lambda r: r["rho_lam"] != "" and abs(float(r["rho_lam"]) - 0.25) < 1e-4),
-        ("Long Memory (beta=1-1e-6)", lambda r: r["beta_fixed"] != "" and float(r["beta_fixed"]) > 0.99),
+    for ax_idx, (b_val, title) in enumerate([
+        (0.6, r"$\beta=0.6$ (Safe region $\rho=0.25$)"),
+        (0.99, r"$\beta=0.99$ (Overshoot $\rho=10.0$)"),
     ]):
         ax = axes[ax_idx]
         matching = [
             r for r in valid_rows
             if r["estimator"] == "tis"
-            and int(r["k"]) == 8
-            and abs(float(r["eta_lam"]) - 0.01) < 1e-4
-            and mom_cond(r)
+            and int(r["k"]) == 16
+            and abs(float(r["eta_lam"]) - 0.1) < 1e-4
+            and r["beta_fixed"] != "" and abs(float(r["beta_fixed"]) - b_val) < 1e-4
         ]
         if not matching:
             continue
@@ -110,19 +162,19 @@ def plot_e2(summary_csv: str, results_dir: str, out_dir: str):
         inner_noise = np.mean(data["inner_noise"], axis=0)
         inner_update = np.mean(data["inner_update"], axis=0)
 
-        ax.plot(diag_t, inner_track, "o-", label=r"Tracking error: $\langle \nabla J, \hat{E}^h - h \rangle$")
+        ax.plot(diag_t, inner_track, "o-", label=r"Tracking: $\langle \nabla J, \hat{E}^h - h \rangle$")
         ax.plot(diag_t, inner_bias, "s-", label=r"History bias: $\langle \nabla J, \hat{E}^b \rangle$")
-        ax.plot(diag_t, inner_noise, "^-", label=r"Smoothed noise: $\langle \nabla J, \hat{E}^\xi \rangle$")
-        ax.plot(diag_t, inner_update, "k--", alpha=0.7, label=r"Total update: $\langle \nabla J, \hat{m} \rangle$")
+        ax.plot(diag_t, inner_noise, "^-", label=r"Noise: $\langle \nabla J, \hat{E}^\xi \rangle$")
+        ax.plot(diag_t, inner_update, "k--", alpha=0.7, label=r"Total: $\langle \nabla J, \hat{m} \rangle$")
 
         ax.axhline(0.0, color="gray", ls=":", alpha=0.5)
         ax.set_xlabel("Diagnostic step $t$")
         ax.set_ylabel(r"Inner Product with $\nabla J(\theta_t)$")
-        ax.set_title(mom_title)
+        ax.set_title(title)
         ax.grid(True, ls="--", alpha=0.5)
         ax.legend(fontsize=8)
 
-    fig.suptitle(r"E2: Momentum Error Decomposition Inner Products for TIS ($k=8, \eta\lambda=0.01$)", fontsize=14, y=1.02)
+    fig.suptitle(r"E2: Momentum Error Decomposition Inner Products for TIS ($k=16, \eta\lambda=0.1$)", fontsize=14, y=1.02)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "e2_decomposition_inner_products.png"), bbox_inches="tight")
     plt.close(fig)

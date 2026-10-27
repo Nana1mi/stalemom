@@ -23,7 +23,7 @@ def momentum_label(row: dict) -> str:
         return rf"rho={val:g}"
     elif row["beta_fixed"] != "":
         val = float(row["beta_fixed"])
-        if val > 0.99:
+        if val > 0.999:
             return r"beta=1-1e-6"
         return rf"beta={val:g}"
     return "Unknown"
@@ -33,11 +33,9 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
     rows = load_summary(summary_csv)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Filter out skipped configurations
     valid_rows = [r for r in rows if r["skipped"] != "True" and r["skipped"] != True]
 
     # 1. Truncation rate heatmaps for tis
-    # One heatmap per c
     tis_rows = [r for r in valid_rows if r["estimator"] == "tis"]
     cs = sorted(list(set(float(r["c"]) for r in tis_rows if r["c"] != "")))
     ks = sorted(list(set(int(r["k"]) for r in tis_rows)))
@@ -52,7 +50,6 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
             matrix = np.zeros((len(ks), len(eta_lams)))
             for i, k_val in enumerate(ks):
                 for j, eta_val in enumerate(eta_lams):
-                    # Average over momentum settings for this (c, k, eta_lam)
                     matching = [
                         float(r["mean_trunc_rate"])
                         for r in tis_rows
@@ -64,7 +61,7 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
 
             im = ax.imshow(matrix, origin="lower", aspect="auto", cmap="YlOrRd", vmin=0.0, vmax=max(0.1, matrix.max()))
             ax.set_xticks(range(len(eta_lams)))
-            ax.set_xticklabels([f"{e:g}" for e in eta_lams])
+            ax.set_xticklabels([f"{e:g}" for e in eta_lams], rotation=30)
             ax.set_yticks(range(len(ks)))
             ax.set_yticklabels(ks)
             ax.set_xlabel(r"$\eta\lambda$")
@@ -79,11 +76,9 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
         print("Saved truncation heatmaps.")
 
     # 2. Gain region / Optimal A_T per momentum setting
-    # Compare momentum settings at their best learning rate for each (estimator, c, k)
-    mom_types = ["No mom (rho=0)", "rho=0.05", "rho=0.1", "rho=0.25", "beta=0.9", "beta=1-1e-6"]
+    all_mom_labels = sorted(list(set(momentum_label(r) for r in valid_rows)))
     
-    # We plot for (is, k in ks) and (tis, c=1.5, k in ks)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5), dpi=150)
     for ax_idx, (est, c_target, title) in enumerate([("is", None, "Full IS (no truncation)"), ("tis", 1.5, "TIS (c = 1.5)")]):
         ax = axes[ax_idx]
         subset = [
@@ -91,11 +86,10 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
             if r["estimator"] == est and (c_target is None or abs(float(r["c"]) - c_target) < 1e-4)
         ]
         
-        # For each k and each momentum setting, find min A_T over eta_lam
         x = np.arange(len(ks))
-        width = 0.13
+        width = 0.8 / len(all_mom_labels)
         
-        for m_idx, m_label in enumerate(mom_types):
+        for m_idx, m_label in enumerate(all_mom_labels):
             best_a_t = []
             best_se = []
             for k_val in ks:
@@ -111,8 +105,8 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
                     best_a_t.append(np.nan)
                     best_se.append(0.0)
                     
-            offset = (m_idx - len(mom_types) / 2 + 0.5) * width
-            ax.bar(x + offset, best_a_t, width, yerr=best_se, capsize=3, label=m_label)
+            offset = (m_idx - len(all_mom_labels) / 2 + 0.5) * width
+            ax.bar(x + offset, best_a_t, width, yerr=best_se, capsize=2, label=m_label)
 
         ax.set_xticks(x)
         ax.set_xticklabels([f"k={k}" for k in ks])
@@ -120,7 +114,7 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
         ax.set_ylabel(r"Optimal $A_T$ (lower is better)")
         ax.set_title(title)
         ax.grid(True, axis="y", ls="--", alpha=0.5)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7, ncol=2)
 
     fig.suptitle(r"E1: Optimal Normalized Gap $A_T$ across Momentum Settings", fontsize=14, y=1.02)
     fig.tight_layout()
@@ -129,13 +123,12 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
     print("Saved momentum gain regions plot.")
 
     # 3. Gap vs t trajectory curves
-    # Choose key configuration: k=8, eta_lam=0.01, c=1.5 for TIS vs IS
     fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=150)
     for ax_idx, est in enumerate(["is", "tis"]):
         ax = axes[ax_idx]
         c_req = 1.5 if est == "tis" else None
         
-        for m_label in ["No mom (rho=0)", "rho=0.25", "beta=0.9", "beta=1-1e-6"]:
+        for m_label in ["No mom (rho=0)", "rho=0.25", "beta=0.9", "beta=0.99"]:
             match = [
                 r for r in valid_rows
                 if r["estimator"] == est
@@ -151,8 +144,7 @@ def plot_e1(summary_csv: str, results_dir: str, out_dir: str):
             if not os.path.exists(npz_path):
                 continue
             data = np.load(npz_path)
-            gap = data["gap"]  # (R, T+1)
-            # Replace NaNs with 1.0 for plotting
+            gap = data["gap"]
             gap_clean = np.nan_to_num(gap, nan=1.0)
             median_gap = np.median(gap_clean, axis=0)
             q25 = np.percentile(gap_clean, 25, axis=0)

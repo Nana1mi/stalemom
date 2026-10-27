@@ -8,20 +8,21 @@ problem:
   init_scale: 1.0
   ref: init
 run:
-  R: 100
+  R: 200
   seed: 12345
   T: 512
   B: 32
   log_every: 1
   diag_every: 8
-  return_traj: true
+  return_traj: false
 sweep:
   estimator: [exact, is, tis, tis_mean, tis_debiased]
   k: [8, 16]
-  eta_lam: [0.01, 0.03]
+  eta_lam: [0.1, 0.3]
   momentum:
-    - {rho_lam: 0.0}
-    - {rho_lam: 0.25}
-    - {beta_fixed: 0.999999}
-  c: [1.5]
+    - {beta_fixed: 0.0}
+    - {beta_fixed: 0.6}
+    - {beta_fixed: 0.9}
+    - {beta_fixed: 0.99}
+  c: [1.2]
   mismatch: [lag]

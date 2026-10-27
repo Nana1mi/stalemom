@@ -9,15 +9,15 @@ problem:
   ref: init
 run:
   B: 32
-  R: 100
+  R: 200
   T: 512
   diag_every: 8
   log_every: 1
-  return_traj: true
+  return_traj: false
   seed: 12345
 sweep:
   c:
-  - 1.5
+  - 1.2
   estimator:
   - exact
   - is
@@ -25,14 +25,15 @@ sweep:
   - tis_mean
   - tis_debiased
   eta_lam:
-  - 0.01
-  - 0.03
+  - 0.1
+  - 0.3
   k:
   - 8
   - 16
   mismatch:
   - lag
   momentum:
-  - rho_lam: 0.0
-  - rho_lam: 0.25
-  - beta_fixed: 0.999999
+  - beta_fixed: 0.0
+  - beta_fixed: 0.6
+  - beta_fixed: 0.9
+  - beta_fixed: 0.99

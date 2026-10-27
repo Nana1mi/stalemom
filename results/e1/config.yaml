@@ -13,6 +13,7 @@ run:
   T: 512
   diag_every: 8
   log_every: 1
+  return_traj: false
   seed: 12345
 sweep:
   c:
@@ -28,6 +29,8 @@ sweep:
   - 0.01
   - 0.03
   - 0.1
+  - 0.3
+  - 1.0
   k:
   - 0
   - 2
@@ -40,5 +43,7 @@ sweep:
   - rho_lam: 0.05
   - rho_lam: 0.1
   - rho_lam: 0.25
+  - beta_fixed: 0.6
   - beta_fixed: 0.9
+  - beta_fixed: 0.99
   - beta_fixed: 0.999999

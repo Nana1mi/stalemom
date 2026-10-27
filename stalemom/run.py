@@ -37,7 +37,6 @@ def expand_sweep(config_data: dict) -> list[tuple[dict, bool, str]]:
 
     lam = float(prob_cfg["lam"])
 
-    # Extract sweep lists with defaults if not present
     estimators = sweep_cfg.get("estimator", ["tis"])
     ks = sweep_cfg.get("k", [0])
     eta_lams = sweep_cfg.get("eta_lam", [0.01])
@@ -48,9 +47,7 @@ def expand_sweep(config_data: dict) -> list[tuple[dict, bool, str]]:
     expanded = []
 
     for est in estimators:
-        # If estimator is exact/onpolicy, k has no effect, so only evaluate k=0
         eff_ks = [0] if est in ("exact", "onpolicy") else ks
-        # If estimator is exact/onpolicy/is, c has no effect ("is 只跑一次")
         eff_cs = [None] if est in ("exact", "onpolicy", "is") else cs
 
         for k, eta_lam, mom, c, mismatch in itertools.product(
@@ -61,7 +58,6 @@ def expand_sweep(config_data: dict) -> list[tuple[dict, bool, str]]:
             reason = ""
             omb = 1.0
 
-            # Determine momentum / omb
             mom_desc = {}
             if "rho_lam" in mom:
                 rho_lam = float(mom["rho_lam"])
@@ -73,6 +69,10 @@ def expand_sweep(config_data: dict) -> list[tuple[dict, bool, str]]:
                 elif rho < eta:
                     skip = True
                     reason = f"rho ({rho:.5g}) < eta ({eta:.5g})"
+                    omb = float("nan")
+                elif abs(rho - eta) < 1e-12:
+                    skip = True
+                    reason = f"rho == eta (equivalent to no momentum)"
                     omb = float("nan")
                 else:
                     omb = float(eta / rho)
@@ -167,6 +167,100 @@ def run_single_task(args: tuple[int, dict, str]) -> dict:
     return summary_row
 
 
+def compute_paired_comparisons(summary_rows: list[dict], out_dir: str) -> list[dict]:
+    """Compute paired differences across estimators sharing the same conditions."""
+    # Index by condition: (k, eta_lam, c_str, mom_key)
+    # Also index exact by (eta_lam, mom_key) because exact has k=0 and c=""
+    exact_map = {}
+    grouped = {}
+
+    for r in summary_rows:
+        if r["skipped"] or not r["npz_file"]:
+            continue
+        mom_key = f"rho_{r['rho_lam']}" if r["rho_lam"] != "" else f"beta_{r['beta_fixed']}"
+        eta_val = float(r["eta_lam"])
+        k_val = int(r["k"])
+
+        if r["estimator"] == "exact":
+            exact_map[(eta_val, mom_key)] = r
+
+        c_str = str(r["c"])
+        cond = (k_val, eta_val, c_str, mom_key)
+        if cond not in grouped:
+            grouped[cond] = {}
+        grouped[cond][r["estimator"]] = r
+
+    paired_results = []
+
+    for (k_val, eta_val, c_str, mom_key) in sorted(grouped.keys(), key=lambda x: (x[0], x[1], str(x[2]), x[3])):
+        est_map = grouped[(k_val, eta_val, c_str, mom_key)]
+        tis_row = est_map.get("tis")
+        debias_row = est_map.get("tis_debiased")
+        mean_row = est_map.get("tis_mean")
+        is_row = est_map.get("is")
+        exact_row = est_map.get("exact") or exact_map.get((eta_val, mom_key))
+
+        # Also find 'is' for this (k, eta, mom) if c was ""
+        if not is_row:
+            is_row = grouped.get((k_val, eta_val, "", mom_key), {}).get("is")
+
+        paired_info = {
+            "k": k_val,
+            "eta_lam": eta_val,
+            "c": c_str,
+            "momentum": mom_key,
+            "det_bias_effect": "",
+            "stoch_bias_effect": "",
+            "stoch_bias_se": "",
+            "tis_vs_is": "",
+            "tis_vs_is_se": "",
+        }
+
+        # Deterministic effect: tis_mean - exact
+        if mean_row and exact_row:
+            mean_npz = np.load(os.path.join(out_dir, mean_row["npz_file"]))
+            exact_npz = np.load(os.path.join(out_dir, exact_row["npz_file"]))
+            a_t_mean = float(np.mean(mean_npz["gap"][0, 1:]))
+            a_t_exact = float(np.mean(exact_npz["gap"][0, 1:]))
+            paired_info["det_bias_effect"] = a_t_mean - a_t_exact
+
+        # Stochastic paired differences
+        if tis_row and debias_row:
+            tis_npz = np.load(os.path.join(out_dir, tis_row["npz_file"]))
+            debias_npz = np.load(os.path.join(out_dir, debias_row["npz_file"]))
+            gap_tis = tis_npz["gap"][:, 1:]
+            gap_debias = debias_npz["gap"][:, 1:]
+            a_t_tis_per_run = np.mean(gap_tis, axis=1)
+            a_t_deb_per_run = np.mean(gap_debias, axis=1)
+            diff = a_t_tis_per_run - a_t_deb_per_run
+            R = len(diff)
+            mean_diff = float(np.mean(diff))
+            se_diff = float(np.std(diff, ddof=1) / np.sqrt(R)) if R > 1 else 0.0
+            paired_info["stoch_bias_effect"] = mean_diff
+            paired_info["stoch_bias_se"] = se_diff
+
+        if tis_row and is_row:
+            tis_npz = np.load(os.path.join(out_dir, tis_row["npz_file"]))
+            is_npz = np.load(os.path.join(out_dir, is_row["npz_file"]))
+            diff = np.mean(tis_npz["gap"][:, 1:], axis=1) - np.mean(is_npz["gap"][:, 1:], axis=1)
+            R = len(diff)
+            paired_info["tis_vs_is"] = float(np.mean(diff))
+            paired_info["tis_vs_is_se"] = float(np.std(diff, ddof=1) / np.sqrt(R)) if R > 1 else 0.0
+
+        if any(v != "" for k, v in paired_info.items() if k not in ("k", "eta_lam", "c", "momentum")):
+            paired_results.append(paired_info)
+
+    if paired_results:
+        paired_csv = os.path.join(out_dir, "paired_summary.csv")
+        fieldnames = list(paired_results[0].keys())
+        with open(paired_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(paired_results)
+
+    return paired_results
+
+
 def main():
     parser = argparse.ArgumentParser(description="stalemom experiment runner")
     parser.add_argument("--config", type=str, required=True, help="Path to config yaml")
@@ -194,7 +288,6 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    # Save copy of full config
     with open(os.path.join(args.out, "config.yaml"), "w", encoding="utf-8") as f:
         yaml.dump(config_data, f, default_flow_style=False)
 
@@ -259,7 +352,6 @@ def main():
             row["beta_fixed"] = cfg["momentum"]["beta_fixed"]
         summary_rows.append(row)
 
-    # Sort rows by run_id
     summary_rows.sort(key=lambda r: r["run_id"])
 
     # Write summary.csv
@@ -270,6 +362,9 @@ def main():
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(summary_rows)
+
+    # Compute paired comparisons
+    paired_rows = compute_paired_comparisons(summary_rows, args.out)
 
     total_time = time.time() - start_time
 

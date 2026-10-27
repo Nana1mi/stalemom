@@ -1,7 +1,7 @@
-Git commit: 0c3bbceaac02c53d1e3d97a7ed5d47fb921c99ac
+Git commit: ef1766bfd51fdb46c749bd8efd7e9ae3a1cfe6bc
 NumPy version: 2.2.6
-Total configurations: 54
-Runnable configurations: 54
+Total configurations: 72
+Runnable configurations: 72
 Skipped configurations: 0
 Configurations with diverged runs: 0
-Total elapsed time: 2.53 s
+Total elapsed time: 2.84 s

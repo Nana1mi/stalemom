@@ -1,0 +1,499 @@
+\documentclass[11pt, a4paper, UTF8]{ctexart}
+
+% ==========================================
+% 中文字体：ctex 在 Windows 下默认把无衬线中文设为微软雅黑，
+% 章节标题、目录会用到它，这里统一换成黑体
+% ==========================================
+\setCJKsansfont{SimHei}
+\ctexset{
+    section       = {format = \centering\Large\bfseries\rmfamily},
+    subsection    = {format = \large\bfseries\rmfamily},
+    subsubsection = {format = \normalsize\bfseries\rmfamily},
+}
+
+% ==========================================
+% 基础宏包与页面布局
+% ==========================================
+\usepackage[left=2.5cm, right=2.5cm, top=2.8cm, bottom=2.8cm]{geometry}
+\usepackage{amsmath, amsfonts, amssymb, amsthm, mathtools, bm}
+\usepackage{booktabs, array, tabularx}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins, breakable}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{microtype}
+
+% ==========================================
+% 颜色定义与超链接设置
+% ==========================================
+\definecolor{primaryblue}{RGB}{24, 76, 120}
+\definecolor{secondaryteal}{RGB}{0, 128, 128}
+\definecolor{accentcrimson}{RGB}{160, 32, 32}
+\definecolor{boxbg}{RGB}{246, 248, 250}
+\definecolor{boxborder}{RGB}{210, 218, 226}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    citecolor=secondaryteal,
+    urlcolor=primaryblue,
+    pdfstartview=FitH
+}
+
+% ==========================================
+% 页眉页脚设置
+% ==========================================
+\setlength{\headheight}{14pt}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{gray} stalemom 理论推导手册}
+\fancyhead[R]{}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.5pt}
+
+% ==========================================
+% 定理与高亮框体环境定义
+% ==========================================
+\newtcolorbox{derivbox}[1][]{
+    enhanced,
+    colback=white,
+    colframe=boxborder,
+    coltitle=primaryblue,
+    fonttitle=\heiti,
+    title=#1,
+    arc=2mm,
+    boxrule=0.8pt,
+    left=4mm, right=4mm, top=3mm, bottom=3mm
+}
+
+\newtcolorbox{warningbox}[1][]{
+    enhanced,
+    colback=accentcrimson!5,
+    colframe=accentcrimson,
+    coltitle=white,
+    fonttitle=\heiti,
+    title=#1,
+    arc=2mm,
+    boxrule=1pt,
+    left=4mm, right=4mm, top=3mm, bottom=3mm
+}
+
+% ==========================================
+% 文档元数据
+% ==========================================
+\title{\LARGE\bfseries 陈旧 Rollout 下长记忆动量与重要性采样截断的相互作用\\ \vspace{0.4em}\Large 模型设定与闭式推导}
+\author{\textbf{孙嘉正}}
+\date{\today}
+
+% ==========================================
+% 正文开始
+% ==========================================
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent 本文档梳理异步强化学习（asynchronous RL）中陈旧采样（stale rollout）、重要性权重截断偏差与优化器动量历史累积的相互作用。在 $K$ 臂 KL 正则 softmax bandit 设置下，给出五项推导：(1) 目标函数全局极值与闭式最优策略；(2) 投影算子 $\Pi$ 与自然策略梯度（NPG）闭式表达；(3) 完整重要性采样（IS）的无偏性与截断重要性采样（TIS）的闭式偏差 $b_t$；(4) 带偏差修正的指数移动平均（EMA）动量递推与加权历史年龄；(5) 动量方向的可加分解及一阶进展分析。推导结果用于实验 E0--E2 的实现和诊断。
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+% ==========================================
+\section{引言与建模原则}
+% ==========================================
+
+在异步强化学习（如异步 PPO 或基于强化学习的推理模型训练）中，通常由分布式采样进程使用旧参数 $\theta_{t-k}$ 生成数据，优化进程在当前参数 $\theta_t$ 处更新。为抑制重要性权重过大引起的方差，算法常对权重进行截断。
+
+截断引入了估计偏差；同时，优化器动量会保留历史梯度的记忆。这种记忆既可能平滑采样噪声，也可能累积单步偏差。为了在排除神经网络函数逼近和环境状态转移等混杂因素的前提下分析这一机制，本文在可精确计算的 KL 正则 softmax bandit 模型上展开推导。
+
+\begin{warningbox}[建模约定]
+本文始终假设：样本来自旧策略 $q_t = p_{\theta_{t-k}}$（$t < k$ 时取 $\theta_0$），梯度在当前参数 $\theta_t$ 处计算。这与异步 SGD 中“梯度在旧参数处算好、延迟送达”的设定不同。
+\end{warningbox}
+
+% ==========================================
+\section{问题表述与全局最优闭式解}
+% ==========================================
+
+\subsection{动作空间与策略参数化}
+
+考虑离散动作集合 $\mathcal{A} = \{1, 2, \dots, K\}$。策略由参数 $\theta = (\theta_1, \dots, \theta_K)^\top \in \mathbb{R}^K$ 通过 softmax 函数确定：
+\begin{equation}
+    p_\theta(a) = \frac{\exp(\theta_a)}{\sum_{j=1}^K \exp(\theta_j)}, \quad \forall a \in \mathcal{A}.
+    \label{eq:softmax}
+\end{equation}
+
+对任意标量 $c \in \mathbb{R}$，有 $p_{\theta + c \mathbf{1}} = p_\theta$（其中 $\mathbf{1} = (1, \dots, 1)^\top$）。为消除常数平移自由度，定义投影矩阵 $\Pi \in \mathbb{R}^{K \times K}$：
+\begin{equation}
+    \Pi = I_K - \frac{1}{K} \mathbf{1}\mathbf{1}^\top \implies \Pi v = v - \mathrm{mean}(v)\mathbf{1}.
+\end{equation}
+矩阵 $\Pi$ 对称且幂等（$\Pi^\top = \Pi$，$\Pi^2 = \Pi$）。若参数更新方向均位于 $\mathrm{range}(\Pi)$ 中，则 $\sum_{a=1}^K \theta_a$ 在迭代过程中保持不变。
+
+\subsection{KL 正则优化目标}
+
+给定确定性奖励向量 $r \in \{0, 1\}^K$，全支持的参考策略 $p_{\mathrm{ref}}$（默认取初始策略 $p_{\mathrm{ref}} = p_{\theta_0}$），正则系数 $\lambda > 0$。优化目标为：
+\begin{equation}
+    J(\theta) = \sum_{a=1}^K p_\theta(a) r_a - \lambda \cdot \mathrm{KL}(p_\theta \parallel p_{\mathrm{ref}}),
+    \label{eq:objective}
+\end{equation}
+其中 KL 散度定义为 $\mathrm{KL}(p \parallel q) = \sum_{a=1}^K p(a) \log \frac{p(a)}{q(a)}$。
+
+\subsection{最优策略与闭式最优目标值推导}
+
+\begin{derivbox}[定理 1\quad 最优策略 $p^*$ 与闭式极值 $J^*$]
+目标函数 $J(\theta)$ 存在唯一的全局最优分布 $p^*$，满足：
+\begin{equation}
+    p^*(a) = \frac{p_{\mathrm{ref}}(a) \exp(r_a / \lambda)}{\sum_{j=1}^K p_{\mathrm{ref}}(j) \exp(r_j / \lambda)}, \quad \forall a \in \mathcal{A},
+    \label{eq:optimal_policy}
+\end{equation}
+且最优目标值具有闭式解：
+\begin{equation}
+    J^* = \lambda \log \left( \sum_{a=1}^K p_{\mathrm{ref}}(a) \exp(r_a / \lambda) \right).
+    \label{eq:optimal_value}
+\end{equation}
+\end{derivbox}
+
+\begin{proof}
+将目标函数 $J$ 视为概率单纯形 $\Delta_K = \{p \in \mathbb{R}^K : \sum_a p_a = 1, p_a \ge 0\}$ 上的泛函。展开式 \eqref{eq:objective}：
+\begin{align}
+    J(p) &= \sum_{a=1}^K p(a) r_a - \lambda \sum_{a=1}^K p(a) \left( \log p(a) - \log p_{\mathrm{ref}}(a) \right) \notag \\
+    &= \lambda \sum_{a=1}^K p(a) \left[ \frac{r_a}{\lambda} + \log p_{\mathrm{ref}}(a) - \log p(a) \right] \notag \\
+    &= \lambda \sum_{a=1}^K p(a) \log \left( \frac{p_{\mathrm{ref}}(a) \exp(r_a / \lambda)}{p(a)} \right).
+\end{align}
+定义配分常数 $Z^*$ 与归一化分布 $p^*$：
+\begin{equation}
+    Z^* \triangleq \sum_{a=1}^K p_{\mathrm{ref}}(a) \exp(r_a / \lambda), \qquad p^*(a) \triangleq \frac{1}{Z^*} p_{\mathrm{ref}}(a) \exp(r_a / \lambda).
+\end{equation}
+将 $p_{\mathrm{ref}}(a) \exp(r_a / \lambda) = Z^* p^*(a)$ 代入对数项：
+\begin{align}
+    J(p) &= \lambda \sum_{a=1}^K p(a) \log \left( \frac{Z^* p^*(a)}{p(a)} \right) \notag \\
+    &= \lambda \sum_{a=1}^K p(a) \log Z^* - \lambda \sum_{a=1}^K p(a) \log \frac{p(a)}{p^*(a)} \notag \\
+    &= \lambda \log Z^* \sum_{a=1}^K p(a) - \lambda \cdot \mathrm{KL}(p \parallel p^*) \notag \\
+    &= \lambda \log \left( \sum_{a=1}^K p_{\mathrm{ref}}(a) \exp(r_a / \lambda) \right) - \lambda \cdot \mathrm{KL}(p \parallel p^*).
+\end{align}
+由于对任意概率分布 $p$ 均有 $\mathrm{KL}(p \parallel p^*) \ge 0$，且等号成立当且仅当 $p = p^*$，因此：
+\begin{equation}
+    \max_{p \in \Delta_K} J(p) = J(p^*) = \lambda \log \left( \sum_{a=1}^K p_{\mathrm{ref}}(a) \exp(r_a / \lambda) \right) \equiv J^*.
+\end{equation}
+最优参数取零均值代表元时为：
+\begin{equation}
+    \theta^* = \Pi \left( \log p_{\mathrm{ref}} + \frac{r}{\lambda} \right).
+\end{equation}
+由于后续更新方向均位于 $\mathrm{range}(\Pi)$ 内，参数和保持为 $\sum_a \theta_{0, a}$，因此训练轨迹若收敛，则收敛到 $\theta^* + \mathrm{mean}(\theta_0)\mathbf{1}$。
+\end{proof}
+
+% ==========================================
+\section{梯度与自然策略梯度（NPG）闭式推导}
+% ==========================================
+
+\subsection{Softmax 的雅可比矩阵与 Fisher 信息阵}
+
+对于 softmax 分布 $p_\theta(a) = \frac{e^{\theta_a}}{\sum_j e^{\theta_j}}$，计算其对参数 $\theta_b$ 的偏导数：
+\begin{equation}
+    \frac{\partial p_\theta(a)}{\partial \theta_b} = \frac{\delta_{ab} e^{\theta_a} \sum_j e^{\theta_j} - e^{\theta_a} e^{\theta_b}}{\left( \sum_j e^{\theta_j} \right)^2} = p_\theta(a) \delta_{ab} - p_\theta(a) p_\theta(b),
+\end{equation}
+其中 $\delta_{ab}$ 为 Kronecker $\delta$。以矩阵形式表示，雅可比矩阵为：
+\begin{equation}
+    \nabla_\theta p_\theta = \mathrm{diag}(p_\theta) - p_\theta p_\theta^\top \triangleq F(\theta) \in \mathbb{R}^{K \times K}.
+    \label{eq:fisher}
+\end{equation}
+矩阵 $F(\theta)$ 同时也是分类分布关于 logit $\theta$ 的 Fisher 信息矩阵。注意到：
+\begin{equation}
+    F(\theta) \mathbf{1} = \mathrm{diag}(p_\theta)\mathbf{1} - p_\theta (p_\theta^\top \mathbf{1}) = p_\theta - p_\theta (1) = \mathbf{0},
+\end{equation}
+因此 $F(\theta)$ 的零空间包含 $\mathrm{span}(\mathbf{1})$，其秩至多为 $K-1$。
+
+\subsection{普通梯度}
+
+利用链式法则计算目标函数 $J(\theta)$ 对 $\theta$ 的梯度：
+\begin{align}
+    \nabla_\theta J(\theta) &= \sum_{a=1}^K r_a \nabla_\theta p_\theta(a) - \lambda \sum_{a=1}^K \nabla_\theta \left[ p_\theta(a) \log \frac{p_\theta(a)}{p_{\mathrm{ref}}(a)} \right] \notag \\
+    &= \sum_{a=1}^K r_a \nabla_\theta p_\theta(a) - \lambda \sum_{a=1}^K \left[ \nabla_\theta p_\theta(a) \log \frac{p_\theta(a)}{p_{\mathrm{ref}}(a)} + p_\theta(a) \cdot \frac{1}{p_\theta(a)} \nabla_\theta p_\theta(a) \right] \notag \\
+    &= \sum_{a=1}^K \left[ r_a - \lambda (\log p_\theta(a) - \log p_{\mathrm{ref}}(a)) - \lambda \right] \nabla_\theta p_\theta(a).
+\end{align}
+注意到 $\sum_{a=1}^K \nabla_\theta p_\theta(a) = \nabla_\theta (1) = \mathbf{0}$，因此常数项 $-\lambda$ 的求和项消去。代入雅可比矩阵 $F(\theta)$，普通梯度为：
+\begin{equation}
+    \nabla_\theta J(\theta) = F(\theta) \Big[ r - \lambda (\log p_\theta - \log p_{\mathrm{ref}}) \Big].
+    \label{eq:vanilla_grad}
+\end{equation}
+
+\subsection{自然策略梯度（NPG）闭式解析解}
+
+根据自然梯度定义，参数空间中的自然策略梯度由 Fisher 矩阵的广义逆给出：
+\begin{equation}
+    \tilde{\nabla} J(\theta) = F(\theta)^\dagger \nabla_\theta J(\theta),
+\end{equation}
+其中 $F(\theta)^\dagger$ 为 Moore-Penrose 广义逆。
+
+\begin{derivbox}[定理 2\quad NPG 方向的闭式表达]
+对任意 $\theta \in \mathbb{R}^K$，自然策略梯度无需数值求解广义逆，有 $\tilde{\nabla} J(\theta) = h(\theta)$，其中
+\begin{equation}
+    h(\theta) \triangleq \Pi \Big[ r - \lambda (\log p_\theta - \log p_{\mathrm{ref}}) \Big].
+    \label{eq:npg_closed_form}
+\end{equation}
+\end{derivbox}
+
+\begin{proof}
+记向量 $v \triangleq r - \lambda (\log p_\theta - \log p_{\mathrm{ref}})$。由式 \eqref{eq:vanilla_grad}，普通梯度为 $\nabla J(\theta) = F(\theta) v$。
+
+将向量 $v$ 分解为投影子空间与全 1 向量方向：
+\begin{equation}
+    v = \Pi v + \frac{\mathbf{1}^\top v}{K} \mathbf{1}.
+\end{equation}
+由于 $F(\theta) \mathbf{1} = \mathbf{0}$，因此：
+\begin{equation}
+    \nabla J(\theta) = F(\theta) \left( \Pi v + \frac{\mathbf{1}^\top v}{K} \mathbf{1} \right) = F(\theta) \Pi v.
+\end{equation}
+考察线性算子 $F(\theta) = \mathrm{diag}(p) - p p^\top$。在与 $\mathbf{1}$ 正交的子空间 $\mathcal{S} = \{x \in \mathbb{R}^K : \mathbf{1}^\top x = 0\}$ 上，对任意非零向量 $x \in \mathcal{S}$：
+\begin{equation}
+    x^\top F(\theta) x = \sum_a p_a x_a^2 - \left(\sum_a p_a x_a\right)^2 = \mathrm{Var}_{a \sim p}[x_a].
+\end{equation}
+若 $x \in \mathcal{S}$ 且 $x \neq \mathbf{0}$，则 $x$ 不是常向量。因为 $p$ 全支持，所以 $\mathrm{Var}_{a \sim p}[x_a] > 0$。因此 $F(\theta)$ 在子空间 $\mathcal{S}$ 上对称正定。
+
+由此，$F(\theta)$ 在 $\mathcal{S}$ 上的广义逆满足 $F(\theta)^\dagger F(\theta) x = x$。因 $\Pi v \in \mathcal{S}$，有：
+\begin{equation}
+    h(\theta) = F(\theta)^\dagger \nabla J(\theta) = F(\theta)^\dagger F(\theta) (\Pi v) = \Pi v = \Pi \Big[ r - \lambda (\log p_\theta - \log p_{\mathrm{ref}}) \Big].
+\end{equation}
+即 $\tilde{\nabla} J(\theta) = h(\theta)$。
+\end{proof}
+
+% ==========================================
+\section{陈旧采样与估计器偏差闭式推导}
+% ==========================================
+
+\subsection{陈旧采样协议}
+
+在第 $t$ 步迭代时：
+\begin{itemize}[leftmargin=2em]
+    \item 当前策略为：$p_t = \mathrm{softmax}(\theta_t)$；
+    \item 行为策略来自滞后 $k$ 步的参数快照：
+    \begin{equation}
+        q_t = \mathrm{softmax}(\theta_{\max(t-k, 0)}), \quad \text{实际滞后量}\ \mathrm{lag}_t = t - \max(t-k, 0);
+    \end{equation}
+    \item 从 $q_t$ 独立抽取 $B$ 个动作样本，动作计数向量满足：
+    \begin{equation}
+        \mathrm{counts} \sim \mathrm{Multinomial}(B, q_t) \implies \mathbb{E}\left[ \frac{\mathrm{counts}}{B} \right] = q_t.
+    \end{equation}
+\end{itemize}
+
+由于 KL 项 $\lambda(\log p_t - \log p_{\mathrm{ref}})$ 可由当前参数解析计算，实验中不对其采样，仅对奖励项进行经验采样估计。随机更新方向为：
+\begin{equation}
+    \hat{g}_t = \Pi \Big[ \hat{\rho}_t - \lambda (\log p_t - \log p_{\mathrm{ref}}) \Big].
+\end{equation}
+
+\subsection{完整重要性采样（IS）的无偏性}
+
+在标准无截断重要性采样（IS）中，奖励项估计器为：
+\begin{equation}
+    \hat{\rho}_t^{\mathrm{IS}} = \frac{\mathrm{counts}}{B} \odot \frac{r}{q_t}.
+\end{equation}
+取条件期望：
+\begin{equation}
+    \mathbb{E}_{\mathrm{counts} \sim q_t} \left[ \hat{\rho}_t^{\mathrm{IS}} \right] = \mathbb{E}\left[\frac{\mathrm{counts}}{B}\right] \odot \frac{r}{q_t} = q_t \odot \frac{r}{q_t} = r.
+\end{equation}
+因此 $\mathbb{E} [ \hat{g}_t^{\mathrm{IS}} \mid \theta_t, q_t ] = \Pi [ r - \lambda (\log p_t - \log p_{\mathrm{ref}}) ] = h(\theta_t)$，估计无偏。但该估计的方差随 $1/q_t(a)$ 增长：第 $a$ 个分量的方差为 $r_a^2 (1 - q_t(a)) / (B\, q_t(a))$。滞后 $k$ 较大时，旧策略在当前高概率动作上的 $q_t(a)$ 可能很小，方差随之急剧上升。
+
+\subsection{截断重要性采样（TIS）与其闭式偏差~\texorpdfstring{$b_t$}{b_t}}
+
+为控制权重方差，截断重要性采样（Truncated IS, TIS）设置截断阈值 $c \ge 1$：
+\begin{equation}
+    \hat{\rho}_t^{\mathrm{TIS}} = \frac{\mathrm{counts}}{B} \odot \min\left( \frac{p_t}{q_t}, c \right) \odot \frac{r}{p_t}.
+\end{equation}
+
+\begin{derivbox}[定理 3\quad TIS 奖励项期望与截断偏差闭式解]
+截断重要性采样的条件期望为：
+\begin{equation}
+    \mathbb{E}_{\mathrm{counts} \sim q_t}\left[ \hat{\rho}_t^{\mathrm{TIS}} \right] = r \odot \min\left( \mathbf{1}, \frac{c q_t}{p_t} \right),
+    \label{eq:tis_exp}
+\end{equation}
+且相对于真实自然策略梯度的偏差向量 $b_t \triangleq \mathbb{E}[\hat{g}_t^{\mathrm{TIS}} \mid \theta_t, q_t] - h(\theta_t)$ 为：
+\begin{equation}
+    b_t = \Pi \left[ r \odot \left( \min\left( \mathbf{1}, \frac{c q_t}{p_t} \right) - \mathbf{1} \right) \right].
+    \label{eq:tis_bias}
+\end{equation}
+\end{derivbox}
+
+\begin{proof}
+考察逐个动作 $a \in \mathcal{A}$ 的条件期望：
+\begin{align}
+    \mathbb{E} \left[ \hat{\rho}_t^{\mathrm{TIS}}(a) \right] &= \mathbb{E}\left[\frac{\mathrm{counts}(a)}{B}\right] \cdot \min\left( \frac{p_t(a)}{q_t(a)}, c \right) \frac{r_a}{p_t(a)} \notag \\
+    &= q_t(a) \cdot \min\left( \frac{p_t(a)}{q_t(a)}, c \right) \frac{r_a}{p_t(a)} \notag \\
+    &= r_a \cdot \min\left( \frac{q_t(a) p_t(a)}{p_t(a) q_t(a)}, \frac{c q_t(a)}{p_t(a)} \right) \notag \\
+    &= r_a \cdot \min\left( 1, \frac{c q_t(a)}{p_t(a)} \right).
+\end{align}
+写成向量逐元素运算即为式 \eqref{eq:tis_exp}。将其代入估计方向 $\hat{g}_t^{\mathrm{TIS}}$，并与真实 NPG 方向 $h(\theta_t) = \Pi[r - \lambda(\log p_t - \log p_{\mathrm{ref}})]$ 相减：
+\begin{align}
+    b_t &= \mathbb{E}[\hat{g}_t^{\mathrm{TIS}} \mid \theta_t, q_t] - h(\theta_t) \notag \\
+    &= \Pi \left[ r \odot \min\left( \mathbf{1}, \frac{c q_t}{p_t} \right) - \lambda(\log p_t - \log p_{\mathrm{ref}}) \right] - \Pi \left[ r - \lambda(\log p_t - \log p_{\mathrm{ref}}) \right] \notag \\
+    &= \Pi \left[ r \odot \left( \min\left( \mathbf{1}, \frac{c q_t}{p_t} \right) - \mathbf{1} \right) \right].
+\end{align}
+即式 \eqref{eq:tis_bias}。
+\end{proof}
+
+式 \eqref{eq:tis_bias} 中的差项满足：
+\begin{equation}
+    \min\left( 1, \frac{c q_t(a)}{p_t(a)} \right) - 1 = \begin{cases}
+        0, & \frac{p_t(a)}{q_t(a)} \le c, \\
+        \frac{c q_t(a)}{p_t(a)} - 1 < 0, & \frac{p_t(a)}{q_t(a)} > c.
+    \end{cases}
+\end{equation}
+因此，当某个高奖励动作的比值 $p_t(a)/q_t(a)$ 超过 $c$ 时，该动作的奖励估计被低估为原值的 $c q_t(a)/p_t(a)$ 倍。经 $\Pi$ 投影后，这会相对减小向该动作方向的更新。
+
+% ==========================================
+\section{带偏差修正的 EMA 动量动力学}
+% ==========================================
+
+\subsection{动量递推与偏差修正}
+
+优化器采用指数移动平均（EMA）动量。记动量系数 $\beta \in [0, 1)$，代码中记补数 $\mathrm{omb} \triangleq 1 - \beta$（one minus beta）。初始化 $m_{-1} = \mathbf{0}$，递推式为：
+\begin{equation}
+    m_t = (1 - \mathrm{omb}) m_{t-1} + \mathrm{omb} \cdot \hat{g}_t.
+\end{equation}
+将历史递归展开：
+\begin{equation}
+    m_t = \sum_{j=0}^t \mathrm{omb} (1 - \mathrm{omb})^{t-j} \hat{g}_j = \sum_{j=0}^t \mathrm{omb} (1 - \mathrm{omb})^j \hat{g}_{t-j}.
+\end{equation}
+权重总和（偏差修正分母 $\mathrm{den}_t$）为：
+\begin{equation}
+    \mathrm{den}_t \triangleq \sum_{j=0}^t \mathrm{omb} (1 - \mathrm{omb})^j = \mathrm{omb} \cdot \frac{1 - (1 - \mathrm{omb})^{t+1}}{1 - (1 - \mathrm{omb})} = 1 - (1 - \mathrm{omb})^{t+1}.
+\end{equation}
+因此，偏差修正后的有效更新方向为：
+\begin{equation}
+    \hat{m}_t = \frac{m_t}{\mathrm{den}_t} = \sum_{j=0}^t \alpha_{t, j} \hat{g}_{t-j}, \quad \text{其中 } \alpha_{t, j} = \frac{\mathrm{omb} (1 - \mathrm{omb})^j}{1 - (1 - \mathrm{omb})^{t+1}},
+\end{equation}
+满足加权和 $\sum_{j=0}^t \alpha_{t, j} = 1$。参数更新为：
+\begin{equation}
+    \theta_{t+1} = \theta_t + \eta \hat{m}_t.
+\end{equation}
+
+\subsection{数值防护（针对长动量~\texorpdfstring{$\beta \to 1$}{beta -> 1}）}
+
+\begin{warningbox}[数值实现]
+当 $\mathrm{omb} \to 0$ 且步数较小时，$(1 - \mathrm{omb})^{t+1} \approx 1 - (t+1)\mathrm{omb}$ 与 $1$ 极为接近，直接计算 $1 - (1 - \mathrm{omb})^{t+1}$ 会发生灾难性抵消（catastrophic cancellation）。在 float64 下，$\mathrm{omb} = 10^{-6}$ 时的相对误差约为 $10^{-10}$；在 float32 或 $\mathrm{omb}$ 更小时误差更明显。
+
+实现中采用如下恒等变形计算分母：
+\begin{equation}
+    1 - (1 - \mathrm{omb})^{t+1} = 1 - \exp\Big( (t+1) \log(1 - \mathrm{omb}) \Big) = -\mathrm{expm1}\Big( (t+1) \cdot \mathrm{log1p}(-\mathrm{omb}) \Big).
+\end{equation}
+\end{warningbox}
+
+\subsection{加权历史年龄与有效时间尺度}
+
+定义当前动量信息的加权平均历史年龄 $H_t$：
+\begin{equation}
+    H_t \triangleq \sum_{j=0}^t j \cdot \alpha_{t, j}.
+\end{equation}
+当 $t \to \infty$ 时，$H_t \to \frac{1 - \mathrm{omb}}{\mathrm{omb}} = \frac{\beta}{1 - \beta}$。
+
+记参数：
+\begin{equation}
+    \rho \triangleq \frac{\eta}{1 - \beta} = \frac{\eta}{\mathrm{omb}}.
+\end{equation}
+实验中固定 $\rho$、扫描 $\beta$，以考察不同记忆长度的影响。
+% TODO(孙): 核对 ρ 定义与代码中动量写法是否一致——带偏差修正的 EMA 下稳态步长为 η，
+% 固定 η/(1-β) 会使 η 随 β 增大而减小，可能与记忆长度效应混淆
+
+% ==========================================
+\section{动量误差的可加分解与一阶进展分析}
+% ==========================================
+
+\subsection{可加分解}
+
+将单步更新向量拆解为三个分量：
+\begin{equation}
+    \hat{g}_t = h_t + b_t + \xi_t,
+\end{equation}
+其中：
+\begin{itemize}[leftmargin=2em]
+    \item $h_t \triangleq h(\theta_t)$：当前参数处的自然策略梯度；
+    \item $b_t \triangleq \mathbb{E}[\hat{g}_t \mid \theta_t, q_t] - h_t$：估计器的条件均值偏差（对于 \texttt{is} 为 0，对于 \texttt{tis} 见式 \eqref{eq:tis_bias}）；
+    \item $\xi_t \triangleq \hat{g}_t - h_t - b_t$：零均值采样噪声（$\mathbb{E}[\xi_t \mid \theta_t, q_t] = \mathbf{0}$）。
+\end{itemize}
+
+对任意序列 $x_{0:t}$，记其带偏差修正的加权平均算子为 $\mathcal{E}_t[x_{0:t}] \triangleq \sum_{j=0}^t \alpha_{t, j} x_{t-j}$，并简记 $\hat{E}^x_t \triangleq \mathcal{E}_t[x_{0:t}]$。
+
+\begin{derivbox}[命题 4\quad 动量方向的可加分解]
+由加权平均算子的线性性，当前实际动量方向 $\hat{m}_t = \mathcal{E}_t[\hat{g}_{0:t}]$ 满足：
+\begin{equation}
+    \hat{m}_t = h(\theta_t) + \mathrm{track}_t + \mathrm{bias\_hist}_t + \mathrm{noise}_t,
+    \label{eq:decomposition}
+\end{equation}
+其中各项定义为：
+\begin{align}
+    \mathrm{track}_t &\triangleq \hat{E}^h_t - h(\theta_t) \quad \text{（跟踪滞后）}, \\
+    \mathrm{bias\_hist}_t &\triangleq \hat{E}^b_t \quad \text{（历史累积截断偏差）}, \\
+    \mathrm{noise}_t &\triangleq \hat{E}^\xi_t \quad \text{（滤波噪声）}.
+\end{align}
+\end{derivbox}
+
+\begin{proof}
+根据定义：
+\begin{align}
+    \hat{m}_t = \mathcal{E}_t\Big[ h_{0:t} + b_{0:t} + \xi_{0:t} \Big] &= \mathcal{E}_t[h_{0:t}] + \mathcal{E}_t[b_{0:t}] + \mathcal{E}_t[\xi_{0:t}] \notag \\
+    &= \hat{E}^h_t + \hat{E}^b_t + \hat{E}^\xi_t.
+\end{align}
+将 $\hat{E}^h_t = h(\theta_t) + (\hat{E}^h_t - h(\theta_t))$ 代入即得式 \eqref{eq:decomposition}。
+\end{proof}
+
+\subsection{一阶进展分解}
+
+在第 $t$ 步，将参数更新 $\Delta \theta_t = \eta \hat{m}_t$ 代入目标函数的一阶展开，得到目标函数的实际单步变化量近似为：
+\begin{equation}
+    J(\theta_{t+1}) - J(\theta_t) \approx \eta \langle \nabla_\theta J(\theta_t), \hat{m}_t \rangle.
+\end{equation}
+记 $v_t \triangleq r - \lambda(\log p_t - \log p_{\mathrm{ref}})$，则 $\nabla J(\theta_t) = F(\theta_t) v_t$，$h(\theta_t) = \Pi v_t$。将式 \eqref{eq:decomposition} 代入内积：
+\begin{equation}
+\begin{aligned}
+    \langle \nabla J(\theta_t), \hat{m}_t \rangle
+    &= \underbrace{\langle \nabla J(\theta_t), h(\theta_t) \rangle}_{\mathcal{P}_t} + \underbrace{\langle \nabla J(\theta_t), \mathrm{track}_t \rangle}_{\mathcal{T}_t} \\
+    &\quad + \underbrace{\langle \nabla J(\theta_t), \mathrm{bias\_hist}_t \rangle}_{\mathcal{B}_t} + \underbrace{\langle \nabla J(\theta_t), \mathrm{noise}_t \rangle}_{\mathcal{N}_t}.
+\end{aligned}
+    \label{eq:inner_product}
+\end{equation}
+
+各项的含义与性质如下：
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{真值推进项 $\mathcal{P}_t = \langle F(\theta_t)v_t, \Pi v_t \rangle = (\Pi v_t)^\top F(\theta_t) (\Pi v_t) \ge 0$}：由 $F(\theta_t)$ 在 $\mathcal{S}$ 上正定，该项非负，仅在最优点（$\Pi v_t = \mathbf{0}$）处取 0。
+    \item \textbf{跟踪滞后项 $\mathcal{T}_t$}：参数变化使 $h(\theta_t)$ 随时间改变，历史加权平均 $\hat{E}^h_t$ 滞后于当前方向。该项符号不定：若 $h$ 方向基本不变、仅幅度随收敛减小，则 $\hat{E}^h_t$ 的幅度大于 $h(\theta_t)$，$\mathcal{T}_t \ge 0$（相当于沿原方向多走一步）；若 $h$ 方向发生转动，则可能 $\mathcal{T}_t < 0$。其符号与大小由实验 E0--E2 检验。
+    \item \textbf{采样波动项 $\mathcal{N}_t$}：因 $\theta_t$ 包含历史噪声的影响，无条件期望 $\mathbb{E}[\mathcal{N}_t]$ 一般不为 0，仅单步噪声在给定历史下的条件期望为 0。动量平均预期可在一定程度上压低噪声方差，但增大 $\beta$ 同时会增加跟踪滞后 $\mathcal{T}_t$，二者的权衡由实验检验。
+    \item \textbf{历史偏差项 $\mathcal{B}_t$}：
+    \begin{itemize}
+        \item 对 \texttt{is} 估计：$b_t = \mathbf{0} \implies \mathcal{B}_t = 0$。
+        \item 对 \texttt{tis} 估计：投影前的差项 $r \odot (\min(1, c q_t / p_t) - 1)$ 逐元素非正，相对压低了高奖励动作的梯度分量。动量会平滑并保留该偏差，预期在滞后较长、截断较多时产生负向积累（$\mathcal{B}_t < 0$）。当累积偏差较大时，可能削弱甚至抵消真值推进项 $\mathcal{P}_t$，其临界边界由实验 E1、E2 检验。
+    \end{itemize}
+\end{enumerate}
+
+% ==========================================
+\section{推导与代码对照表}
+% ==========================================
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{理论模块 / 关键量} & \textbf{数学公式 / 符号} & \textbf{对应代码模块与函数} \\
+\midrule
+Softmax 策略与投影 & $p_\theta = \mathrm{softmax}(\theta), \ \Pi = I - \frac{1}{K}\mathbf{1}\mathbf{1}^\top$ & \texttt{stalemom.bandit.softmax, project} \\
+最优极值与解析策略 & $J^* = \lambda \log \sum_a p_{\mathrm{ref}}(a) e^{r_a/\lambda}, \ p^*$ & \texttt{stalemom.bandit.optimal\_value} \\
+精确自然策略梯度 & $h(\theta) = \Pi[r - \lambda(\log p_\theta - \log p_{\mathrm{ref}})]$ & \texttt{stalemom.bandit.exact\_npg\_dir} \\
+普通策略梯度 & $\nabla J(\theta) = F(\theta)[r - \lambda(\log p_\theta - \log p_{\mathrm{ref}})]$ & \texttt{stalemom.bandit.vanilla\_grad} \\
+截断偏差闭式解 & $b_t = \Pi[r \odot (\min(1, cq_t/p_t) - 1)]$ & \texttt{stalemom.estimators.tis\_bias} \\
+EMA 动量与防护 & $\mathrm{den}_t = -\mathrm{expm1}((t+1)\mathrm{log1p}(-\mathrm{omb}))$ & \texttt{stalemom.optim.\allowbreak bias\_correction\_den} \\
+历史年龄 & $H_t = \sum_j j \alpha_{t, j}$ & \texttt{stalemom.optim.history\_age} \\
+可加误差分解 & $\hat{m}_t = h_t + \mathrm{track}_t + \mathrm{bias\_hist}_t + \mathrm{noise}_t$ & \texttt{stalemom.sim.simulate (diag)} \\
+\bottomrule
+\end{tabularx}
+\caption{数学推导与代码实现映射表}
+\label{tab:mapping}
+\end{table}
+
+\section{结语}
+本文推导了 KL 正则 softmax bandit 下最优解、NPG 方向、截断偏差及 EMA 动量的一组闭式表达，并将动量更新拆解为推进项、跟踪滞后、历史偏差与滤波噪声四项。关于长动量在截断下收益临界条件的定性推测，将在实验 E0--E2 中通过数值模拟检验。
+
+\end{document}

@@ -5,6 +5,8 @@ __pycache__/
 *.zip
 results/**/*.npz
 !results/e2/*.npz
+results/**/*.pt
+results/e5/l0_local_verify/tiny_model/
 
 # LaTeX build artifacts
 *.aux

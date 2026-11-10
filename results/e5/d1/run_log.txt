@@ -1,2 +1,2 @@
 [D1] Starting 48 conditions x 3 freeze steps (R=200, K=64)...
-[D1] Completed 144 rows in 1.78s. Saved to results/e5/d1\summary.csv
+[D1] Completed 144 rows in 2.05s. Saved to results/e5/d1\summary.csv

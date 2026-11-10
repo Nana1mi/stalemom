@@ -517,8 +517,9 @@ def run_d1_condition(task: dict) -> list[dict]:
     m_hat_all = res["m_hat"]  # (R_traj, T, 10)
 
     # Dedicated deterministic RNG for D1 frozen sampling
-    diag_seed = seed + 100000 + hash((estimator, k, B, round(beta, 4))) % 900000
-    rng = np.random.default_rng(abs(diag_seed))
+    cond_key = f"{estimator}_{k}_{B}_{beta:.4f}"
+    diag_seed = seed + 100000 + (CountSketch._name_to_seed(cond_key) % 900000)
+    rng = np.random.default_rng(int(diag_seed))
 
     rows = []
     c3_rows = []

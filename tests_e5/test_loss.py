@@ -128,6 +128,105 @@ def test_staleness_buffer_ring_semantics():
         assert behav["w"][0] == expected_step
 
 
+def test_staleness_buffer_missing_snapshot_raises():
+    """Item 4: StalenessBuffer must raise KeyError directly if target snapshot is missing."""
+    buf = StalenessBuffer(k=4)
+    # Empty buffer -> raises KeyError
+    with pytest.raises(KeyError, match="StalenessBuffer is empty"):
+        buf.get_behavior_weights(0)
+
+    # Push steps 1..5 without step 0 -> t=2 needs step 0, which is missing
+    for t in range(1, 6):
+        buf.push(t, {"w": t})
+    with pytest.raises(KeyError, match="Target behavior snapshot step=0 not found"):
+        buf.get_behavior_weights(2)
+
+    # Push step 10 -> evicts earlier steps from maxlen=5; requesting step 5 (target=1) raises KeyError
+    for t in range(6, 11):
+        buf.push(t, {"w": t})
+    with pytest.raises(KeyError, match="Target behavior snapshot step=1 not found"):
+        buf.get_behavior_weights(5)
+
+
+def test_microbatch_1_vs_4_gradient_equivalence():
+    """Item 3: 1 micro-batch and 4 micro-batches using global N_tok must produce identical gradients (error < 1e-5)."""
+    import torch
+    from llm.train import accumulate_grpo_tis_microbatches
+
+    torch.manual_seed(2026)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    class TinyCausalLM(torch.nn.Module):
+        def __init__(self, vocab_size: int = 32, hidden: int = 16):
+            super().__init__()
+            self.embed = torch.nn.Embedding(vocab_size, hidden)
+            self.proj = torch.nn.Linear(hidden, vocab_size, bias=True)
+
+        def forward(self, input_ids, attention_mask=None, **kwargs):
+            h = torch.tanh(self.embed(input_ids))
+            logits = self.proj(h)
+
+            class Out:
+                pass
+
+            out = Out()
+            out.logits = logits
+            return out
+
+    model_1 = TinyCausalLM().to(dev, dtype=torch.float32)
+    model_4 = TinyCausalLM().to(dev, dtype=torch.float32)
+    model_4.load_state_dict(model_1.state_dict())
+    behav_model = TinyCausalLM().to(dev, dtype=torch.float32)
+
+    B, T = 8, 12
+    prompt_len = 4
+    R_len = T - 1
+    input_ids = torch.randint(0, 32, (B, T), device=dev)
+    attention_mask = torch.ones((B, T), dtype=torch.long, device=dev)
+
+    # Give each sequence a different valid response length so micro-batch token counts differ!
+    response_mask = torch.zeros((B, R_len), dtype=torch.float32, device=dev)
+    lengths = [2, 7, 4, 8, 3, 6, 5, 8]
+    for i, L in enumerate(lengths):
+        response_mask[i, prompt_len - 1 : prompt_len - 1 + L] = 1.0
+
+    advantages = torch.tensor([1.2, -0.8, 0.5, -0.9, 1.1, -1.1, 0.4, -0.4], dtype=torch.float32, device=dev)
+
+    stats_1 = accumulate_grpo_tis_microbatches(
+        model=model_1,
+        behav_model=behav_model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        response_mask=response_mask,
+        advantages=advantages,
+        k=4,
+        c=1.2,
+        micro_batch_size=8,  # 1 micro-batch
+        use_bf16=False,
+    )
+    stats_4 = accumulate_grpo_tis_microbatches(
+        model=model_4,
+        behav_model=behav_model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        response_mask=response_mask,
+        advantages=advantages,
+        k=4,
+        c=1.2,
+        micro_batch_size=2,  # 4 micro-batches with unequal token counts
+        use_bf16=False,
+    )
+
+    assert abs(stats_1["loss"] - stats_4["loss"]) < 1e-6
+    assert abs(stats_1["trunc_rate"] - stats_4["trunc_rate"]) < 1e-6
+    assert abs(stats_1["mean_w"] - stats_4["mean_w"]) < 1e-6
+
+    for (n1, p1), (n4, p4) in zip(model_1.named_parameters(), model_4.named_parameters()):
+        assert n1 == n4
+        max_diff = float(torch.max(torch.abs(p1.grad - p4.grad)).item())
+        assert max_diff < 1e-5, f"Param {n1} max grad diff {max_diff} >= 1e-5"
+
+
 def test_boxed_reward_parsing():
     """SPEC E5 §6.1: exact match on \\boxed{} numeric answer."""
     assert extract_boxed_answer("Step 1... Therefore \\boxed{42}.") == "42"
@@ -138,17 +237,17 @@ def test_boxed_reward_parsing():
 
 
 def test_online_llm_diag_accumulator_matches_nested_stats():
-    """Verify OnlineLLMDiagAccumulator matches nested_stats on a multi-tensor dictionary."""
+    """Verify OnlineLLMDiagAccumulator (GPU fp32 vectors, float64 scalars) matches nested_stats on a multi-tensor dict."""
     rng = np.random.default_rng(105)
     S, R = 8, 4
     d1, d2 = 50, 70
-    G1 = rng.normal(0.5, 1.0, size=(S * R, d1))
-    G2 = rng.normal(-0.3, 1.0, size=(S * R, d2))
-    G_full = np.concatenate([G1, G2], axis=1)
+    G1 = rng.normal(0.5, 1.0, size=(S * R, d1)).astype(np.float32)
+    G2 = rng.normal(-0.3, 1.0, size=(S * R, d2)).astype(np.float32)
+    G_full = np.concatenate([G1, G2], axis=1).astype(np.float64)
 
-    m1 = rng.normal(0.2, 1.0, size=d1)
-    m2 = rng.normal(-0.1, 1.0, size=d2)
-    m_full = np.concatenate([m1, m2])
+    m1 = rng.normal(0.2, 1.0, size=d1).astype(np.float32)
+    m2 = rng.normal(-0.1, 1.0, size=d2).astype(np.float32)
+    m_full = np.concatenate([m1, m2]).astype(np.float64)
     norm_m = float(np.linalg.norm(m_full))
 
     acc = OnlineLLMDiagAccumulator(S=S, R=R, norm_m=norm_m, sketch_dim=2**15)
@@ -166,6 +265,6 @@ def test_online_llm_diag_accumulator_matches_nested_stats():
     res_online = acc.finalize()
     res_batch = nested_stats(G_full, m_full, R=R, compute_jk=True)
 
-    for k in ["N_bar", "H_hat", "M", "var_total", "var_rollout", "var_prompt", "SNR_hat", "inner_m_h", "C1", "C2_hat", "C1_pred"]:
-        assert np.isclose(res_online[k], res_batch[k], rtol=1e-10, atol=1e-10)
+    for k in ["N_bar", "H_hat", "M", "var_total", "var_rollout", "var_prompt", "SNR_hat", "inner_m_h", "C1", "C2_hat", "C1_pred", "C1_pred_legacy"]:
+        assert np.isclose(res_online[k], res_batch[k], rtol=1e-5, atol=1e-5), f"Mismatch on {k}: {res_online[k]} vs {res_batch[k]}"
     assert res_online["sketch_rel_err"] < 0.05

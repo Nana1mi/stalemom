@@ -4,6 +4,7 @@ model: Qwen/Qwen3-0.6B
 enable_thinking: false
 master_weights_dtype: fp32
 compute_dtype: bf16
+micro_batch_size: 4
 checkpoints: [0, 50, 100]
 k: 0
 c: inf

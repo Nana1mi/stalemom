@@ -6,6 +6,7 @@ enable_thinking: false
 master_weights_dtype: fp32
 compute_dtype: bf16
 gradient_checkpointing: true
+micro_batch_size: 4
 steps: 150
 eval_every: 50
 conditions:

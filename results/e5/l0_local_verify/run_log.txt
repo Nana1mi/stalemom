@@ -10,3 +10,9 @@
 [diag step=0000] H_hat=3.1704e-01 SNR=8.1600 C1=nan C1_pred=nan C2_hat=nan sketch_rel_err=0.0000 time=0.64s
 [diag step=0001] H_hat=3.0354e-01 SNR=2.1322 C1=0.0000 C1_pred=0.0000 C2_hat=0.0000 sketch_rel_err=0.0000 time=0.57s
 [diag step=0002] H_hat=5.6580e-01 SNR=260.0436 C1=1.0000 C1_pred=0.9987 C2_hat=1.0006 sketch_rel_err=0.0000 time=0.55s
+[step 000/003] loss=0.0000 reward=0.500 zero_adv=0.00 dup_grp=0.00 grad_norm=0.0000 C1=nan trunc=0.0000 sync_max_diff=0.00e+00 vram=0.38GB eval_acc=0.744
+[step 001/003] loss=0.0000 reward=0.625 zero_adv=0.50 dup_grp=0.50 grad_norm=0.3494 C1=0.0000 trunc=0.0000 sync_max_diff=0.00e+00 vram=0.40GB eval_acc=nan
+[step 002/003] loss=-0.0000 reward=0.375 zero_adv=0.50 dup_grp=0.50 grad_norm=0.3494 C1=-1.0000 trunc=0.0000 sync_max_diff=0.00e+00 vram=0.40GB eval_acc=0.744
+[diag step=0000] H_hat=3.1704e-01 SNR=8.1600 C1=nan C1_pred=nan C2_hat=nan sketch_rel_err=0.0000 time=0.61s
+[diag step=0001] H_hat=3.0354e-01 SNR=2.1322 C1=0.0000 C1_pred=0.0000 C2_hat=0.0000 sketch_rel_err=0.0000 time=0.57s
+[diag step=0002] H_hat=5.6580e-01 SNR=260.0436 C1=1.0000 C1_pred=0.9987 C2_hat=1.0006 sketch_rel_err=0.0000 time=0.50s

@@ -1,2 +1,2 @@
-model,optimizer,lr,momentum,effective_lr,k,c,seed,steps,final_reward_mean,final_eval_acc,diverged,mean_step_time_gen,mean_step_time_train,mean_step_time_sync,max_sync_logprob_diff
-results/e5/l0_local_verify/tiny_model,sgd_mom,0.001,0.9,0.010000000000000002,1,1.2,42,3,0.375,0.744,False,4.538788466666574,0.8117752666667002,0.007835866666634198,0.0
+model,optimizer,lr,momentum,effective_lr,k,c,seed,steps,final_reward_mean,final_eval_acc,mean_zero_adv_frac,mean_dup_group_frac,diverged,mean_step_time_gen,mean_step_time_train,mean_step_time_sync,max_sync_logprob_diff,peak_vram_gb
+results/e5/l0_local_verify/tiny_model,sgd_mom,0.001,0.9,0.010000000000000002,1,1.2,42,3,0.375,0.744,0.3333333333333333,0.3333333333333333,False,1.0299723333332622,0.14119669999990947,0.007102766666624423,0.0,0.40487194061279297

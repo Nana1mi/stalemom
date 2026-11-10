@@ -161,14 +161,30 @@ def compute_grpo_tis_loss_torch(
     return loss, w, stats
 
 
+def _chunk_logsumexp_gather(logits_chunk, targets_chunk):
+    """Compute per-token logprob for a sequence chunk using float32 logsumexp + gather without full log_softmax."""
+    import torch
+
+    logits_f32 = logits_chunk.to(dtype=torch.float32)
+    target_logits = torch.gather(logits_f32, dim=-1, index=targets_chunk.unsqueeze(-1)).squeeze(-1)
+    lse = torch.logsumexp(logits_f32, dim=-1)
+    return target_logits - lse
+
+
 def compute_response_logprobs(
     model,
     input_ids,
     attention_mask,
-     use_bf16: bool = True,
+    use_bf16: bool = True,
+    chunk_size: int = 64,
 ):
-    """Compute per-token log probabilities log pi(y_t | y_{<t}) for positions 1..L-1 in float32."""
+    """Compute per-token log probabilities log pi(y_t | y_{<t}) for positions 1..L-1 in float32.
+
+    Uses chunked logsumexp + gather along the sequence dimension (with activation checkpointing when
+    grad is enabled) so the full (B, L-1, V) fp32 log_softmax tensor is never materialized in memory.
+    """
     import torch
+    from torch.utils.checkpoint import checkpoint
 
     dev_type = "cuda" if input_ids.is_cuda else "cpu"
     amp_enabled = bool(use_bf16 and (dev_type == "cuda" or torch.cpu.amp is not None))
@@ -176,10 +192,26 @@ def compute_response_logprobs(
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         logits = outputs.logits[:, :-1, :]  # (B, L-1, V)
 
-    log_probs_all = torch.log_softmax(logits.to(dtype=torch.float32), dim=-1)
-    target_ids = input_ids[:, 1:].unsqueeze(-1)  # (B, L-1, 1)
-    token_logprobs = torch.gather(log_probs_all, dim=-1, index=target_ids).squeeze(-1)  # (B, L-1)
-    return token_logprobs
+    target_ids = input_ids[:, 1:]  # (B, L-1)
+    seq_len = int(logits.shape[1])
+    step = max(int(chunk_size), 1)
+    chunks = []
+    for s in range(0, seq_len, step):
+        e = min(s + step, seq_len)
+        logits_slice = logits[:, s:e, :]
+        targets_slice = target_ids[:, s:e]
+        if logits.requires_grad:
+            lp_chunk = checkpoint(
+                _chunk_logsumexp_gather,
+                logits_slice,
+                targets_slice,
+                use_reentrant=False,
+            )
+        else:
+            lp_chunk = _chunk_logsumexp_gather(logits_slice, targets_slice)
+        chunks.append(lp_chunk)
+
+    return torch.cat(chunks, dim=1) if len(chunks) > 1 else chunks[0]
 
 
 def accumulate_grpo_tis_microbatches(
@@ -354,6 +386,100 @@ def compute_online_c1(
     return float(dot / (np.sqrt(norm_m_sq) * np.sqrt(norm_g_sq)))
 
 
+def compute_grad_norm_and_online_c1_gpu(
+    optimizer,
+    model,
+    opt_name: str,
+) -> tuple[float, float]:
+    """Compute (grad_norm, online_C1) directly on GPU using p.grad and optimizer.state[p] without CPU copies."""
+    import torch
+
+    opt_key = opt_name.lower()
+    dot = None
+    norm_m_sq = None
+    norm_g_sq = None
+
+    for _, p in model.named_parameters():
+        if not p.requires_grad or p.grad is None:
+            continue
+        g64 = p.grad.detach().to(dtype=torch.float64)
+        if norm_g_sq is None:
+            dev = g64.device
+            dot = torch.zeros((), dtype=torch.float64, device=dev)
+            norm_m_sq = torch.zeros((), dtype=torch.float64, device=dev)
+            norm_g_sq = torch.zeros((), dtype=torch.float64, device=dev)
+        norm_g_sq = norm_g_sq + torch.sum(g64 * g64)
+
+        state = optimizer.state.get(p, {})
+        buf = None
+        if opt_key in ("sgd_mom", "sgd"):
+            buf = state.get("momentum_buffer", None)
+        elif opt_key in ("adamw", "rmsprop_via_adamw"):
+            buf = state.get("exp_avg", None)
+
+        if buf is not None:
+            m64 = buf.detach().to(device=g64.device, dtype=torch.float64)
+            norm_m_sq = norm_m_sq + torch.sum(m64 * m64)
+            dot = dot + torch.sum(m64 * g64)
+
+    if norm_g_sq is None:
+        return 0.0, float("nan")
+
+    ng2 = float(norm_g_sq.item())
+    nm2 = float(norm_m_sq.item())
+    d_val = float(dot.item())
+    grad_norm = float(np.sqrt(max(ng2, 0.0)))
+    if nm2 <= 0.0 or ng2 <= 0.0:
+        return grad_norm, float("nan")
+    return grad_norm, float(d_val / (np.sqrt(nm2) * np.sqrt(ng2)))
+
+
+def step_and_compute_update_norm(optimizer) -> float:
+    """Step optimizer and compute ||theta_{t+1} - theta_t||_2 without cloning all parameters at once.
+
+    Steps one parameter tensor at a time so only a single parameter's temporary tensor exists in memory,
+    matching a full-model `prev_params` clone bit-for-bit across SGD, SGD+mom, and AdamW.
+    """
+    import torch
+
+    update_norm_sq = None
+    for group in optimizer.param_groups:
+        orig_params = list(group["params"])
+        for p in orig_params:
+            if not p.requires_grad or p.grad is None:
+                continue
+            p_prev = p.detach().clone()
+            group["params"] = [p]
+            optimizer.step()
+            diff64 = (p.detach() - p_prev).to(dtype=torch.float64)
+            if update_norm_sq is None:
+                update_norm_sq = torch.zeros((), dtype=torch.float64, device=diff64.device)
+            update_norm_sq = update_norm_sq + torch.sum(diff64 * diff64)
+            del p_prev, diff64
+        group["params"] = orig_params
+
+    if update_norm_sq is None:
+        return 0.0
+    return float(np.sqrt(max(float(update_norm_sq.item()), 0.0)))
+
+
+def compute_dup_group_frac(responses: list[Any], group_size: int) -> float:
+    """Compute fraction of prompt groups where all `group_size` responses in the group are identical."""
+    if group_size <= 1 or len(responses) == 0:
+        return 0.0
+    if len(responses) % group_size != 0:
+        raise ValueError(f"len(responses)={len(responses)} must be divisible by group_size={group_size}")
+
+    num_groups = len(responses) // group_size
+    dup_groups = 0
+    for g in range(num_groups):
+        grp = responses[g * group_size : (g + 1) * group_size]
+        normed = [tuple(r) if isinstance(r, (list, np.ndarray)) else r for r in grp]
+        if len(set(normed)) == 1:
+            dup_groups += 1
+    return float(dup_groups / num_groups)
+
+
 def check_disk_free_gb(path: str | Path, min_free_gb: float = 10.0) -> float:
     """Verify disk free space >= min_free_gb (SPEC E5 §6.4)."""
     p = Path(path).resolve()
@@ -416,6 +542,7 @@ class RolloutBackend:
         device: str | Any,
         vllm_cfg: dict | None = None,
         use_bf16: bool = True,
+        seed: int = 42,
     ):
         import torch
         from transformers import AutoModelForCausalLM
@@ -425,6 +552,10 @@ class RolloutBackend:
         self.tokenizer = tokenizer
         self.device = torch.device(device)
         self.use_bf16 = bool(use_bf16)
+        self.seed = int(seed)
+        vcfg = vllm_cfg or {}
+        self.enable_sleep_mode = bool(vcfg.get("enable_sleep_mode", True))
+        self._is_sleeping = False
 
         if self.backend == "hf":
             dtype = torch.bfloat16 if (self.use_bf16 and self.device.type == "cuda") else torch.float32
@@ -434,17 +565,31 @@ class RolloutBackend:
             self.vllm_engine = None
         elif self.backend == "vllm":
             from vllm import LLM
-            vcfg = vllm_cfg or {}
             self.vllm_engine = LLM(
                 model=model_name,
                 dtype="bfloat16",
-                enable_sleep_mode=bool(vcfg.get("enable_sleep_mode", True)),
+                enable_sleep_mode=self.enable_sleep_mode,
                 gpu_memory_utilization=float(vcfg.get("gpu_memory_utilization", 0.30)),
+                seed=int(vcfg.get("seed", self.seed)),
                 trust_remote_code=True,
             )
             self.hf_model = None
         else:
             raise ValueError(f"Unsupported rollout backend: {backend}")
+
+    def sleep(self, level: int = 1):
+        """Offload vLLM weights/KV cache during training forward/backward to save GPU memory."""
+        if self.backend == "vllm" and self.vllm_engine is not None and self.enable_sleep_mode:
+            if not self._is_sleeping and hasattr(self.vllm_engine, "sleep"):
+                self.vllm_engine.sleep(level=level)
+                self._is_sleeping = True
+
+    def wake_up(self):
+        """Wake up vLLM engine before weight synchronization or rollout generation."""
+        if self.backend == "vllm" and self.vllm_engine is not None and self.enable_sleep_mode:
+            if self._is_sleeping and hasattr(self.vllm_engine, "wake_up"):
+                self.vllm_engine.wake_up()
+                self._is_sleeping = False
 
     def sync_weights(self, fp32_state_dict: dict[str, Any]):
         """Synchronize behavior weights theta_{t-k} (converted to bf16) into the rollout engine."""
@@ -459,14 +604,39 @@ class RolloutBackend:
             self.hf_model.load_state_dict(cast_sd, strict=True)
             self.hf_model.eval()
         elif self.backend == "vllm":
-            model_runner = (
-                self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner
-            )
+            self.wake_up()
             weights = [
                 (k, v.to(dtype=torch.bfloat16))
                 for k, v in fp32_state_dict.items()
             ]
-            model_runner.model.load_weights(weights)
+            # 1. Try direct V0 driver_worker.model_runner path first
+            try:
+                model_runner = (
+                    self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner
+                )
+                model_runner.model.load_weights(weights)
+                return
+            except AttributeError:
+                pass
+            # 2. Try driver_worker.worker.model_runner
+            try:
+                model_runner = (
+                    self.vllm_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+                )
+                model_runner.model.load_weights(weights)
+                return
+            except AttributeError:
+                pass
+            # 3. Fallback to public vLLM apply_model API (vLLM V1 / 0.7+)
+            if hasattr(self.vllm_engine, "apply_model"):
+                self.vllm_engine.apply_model(lambda m: m.load_weights(weights))
+                return
+            if hasattr(self.vllm_engine, "llm_engine") and hasattr(self.vllm_engine.llm_engine, "model_executor"):
+                executor = self.vllm_engine.llm_engine.model_executor
+                if hasattr(executor, "apply_model"):
+                    executor.apply_model(lambda m: m.load_weights(weights))
+                    return
+            raise RuntimeError("Unable to synchronize weights into vLLM engine via driver_worker or apply_model")
 
     def generate_group_rollouts(
         self,
@@ -488,6 +658,7 @@ class RolloutBackend:
         eos_id = self.tokenizer.eos_token_id
 
         all_seq_ids: list[list[int]] = []
+        all_resp_ids: list[list[int]] = []
         all_prompt_lens: list[int] = []
         all_resp_lens: list[int] = []
         all_rewards: list[float] = []
@@ -528,6 +699,7 @@ class RolloutBackend:
                         rew = compute_exact_match_reward(text, item.ground_truth)
 
                         all_seq_ids.append(full_seq)
+                        all_resp_ids.append(resp_part)
                         all_prompt_lens.append(p_len)
                         all_resp_lens.append(len(resp_part))
                         all_rewards.append(rew)
@@ -535,12 +707,13 @@ class RolloutBackend:
         elif self.backend == "vllm":
             from vllm import SamplingParams
 
+            self.wake_up()
+            # Use engine-level seed configured on LLM(...); do NOT pass per-request seed in SamplingParams
             sp = SamplingParams(
                 n=group_size,
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_new_tokens,
-                seed=seed,
                 logprobs=1,
             )
             prompts = [it.prompt_text for it in items]
@@ -555,6 +728,7 @@ class RolloutBackend:
                     full_seq = p_ids + r_ids
                     rew = compute_exact_match_reward(comp.text, item.ground_truth)
                     all_seq_ids.append(full_seq)
+                    all_resp_ids.append(r_ids)
                     all_prompt_lens.append(p_len)
                     all_resp_lens.append(len(r_ids))
                     all_rewards.append(rew)
@@ -585,6 +759,7 @@ class RolloutBackend:
 
         rewards_np = np.array(all_rewards, dtype=np.float64)
         adv_np, zero_adv_frac = compute_grpo_advantages(rewards_np, group_size=group_size)
+        dup_group_frac = compute_dup_group_frac(all_resp_ids, group_size=group_size)
         advantages_t = torch.tensor(adv_np, dtype=torch.float32, device=self.device)
 
         return {
@@ -594,6 +769,7 @@ class RolloutBackend:
             "advantages": advantages_t,
             "rewards": rewards_np,
             "zero_adv_frac": zero_adv_frac,
+            "dup_group_frac": dup_group_frac,
             "resp_len_mean": float(np.mean(all_resp_lens)) if all_resp_lens else 0.0,
             "vllm_rollout_logprobs": all_rollout_logprobs,
             "prompt_lens": all_prompt_lens,
@@ -668,26 +844,25 @@ def save_checkpoint(
     ckpt_dir: Path,
     step: int,
     model,
-    behav_state_dict: dict[str, Any],
+    behav_state_dict: dict[str, Any] | None,
     optimizer,
     opt_name: str,
     config: dict,
     min_free_gb: float = 10.0,
+    k: int | None = None,
 ) -> Path:
-    """Save step checkpoint containing fp32 weights, behavior weights, and m_{t-1} (§6.4)."""
+    """Save step checkpoint containing fp32 weights, behavior weights (only when k > 0), and m_{t-1} (§6.4)."""
     import torch
 
     check_disk_free_gb(ckpt_dir, min_free_gb=min_free_gb)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f"ckpt_step_{step:04d}.pt"
 
+    k_val = int(config.get("k", 0)) if k is None else int(k)
+
     fp32_weights = {
-        k: v.detach().to(device="cpu", dtype=torch.float32).clone()
-        for k, v in model.state_dict().items()
-    }
-    behav_cpu = {
-        k: v.detach().to(device="cpu", dtype=torch.float32).clone()
-        for k, v in behav_state_dict.items()
+        name: v.detach().to(device="cpu", dtype=torch.float32).clone()
+        for name, v in model.state_dict().items()
     }
     m_dict, sq_dict, norm_m = extract_momentum_buffers(optimizer, model, opt_name)
 
@@ -695,12 +870,16 @@ def save_checkpoint(
         "step": int(step),
         "optimizer_name": opt_name,
         "model_state_dict": fp32_weights,
-        "behav_state_dict": behav_cpu,
         "momentum_buffer": m_dict,
         "exp_avg_sq": sq_dict,
         "norm_m": norm_m,
         "config": config,
     }
+    if k_val > 0 and behav_state_dict is not None:
+        payload["behav_state_dict"] = {
+            name: v.detach().to(device="cpu", dtype=torch.float32).clone()
+            for name, v in behav_state_dict.items()
+        }
     torch.save(payload, ckpt_path)
     return ckpt_path
 
@@ -744,6 +923,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.cuda.reset_peak_memory_stats()
 
     device_str = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
@@ -764,7 +944,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
     momentum = float(cfg.get("momentum", cfg.get("smoke_checks", {}).get("momentum", 0.9)))
     dampening = float(cfg.get("dampening", cfg.get("smoke_checks", {}).get("dampening", 0.0)))
     betas = cfg.get("betas", [0.9, 0.999])
-    micro_batch_size = cfg.get("micro_batch_size", None)
+    micro_batch_size = int(cfg.get("micro_batch_size", 4))
 
     rollout_cfg = cfg.get("rollout", {})
     prompts_per_step = int(rollout_cfg.get("prompts_per_step", cfg.get("prompts_per_step", 32)))
@@ -813,6 +993,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
         device=device,
         vllm_cfg=cfg.get("vllm", {}),
         use_bf16=use_bf16,
+        seed=seed,
     )
 
     optimizer = build_optimizer(
@@ -833,6 +1014,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
         "loss",
         "reward_mean",
         "zero_adv_frac",
+        "dup_group_frac",
         "resp_len_mean",
         "grad_norm",
         "update_norm",
@@ -846,6 +1028,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
         "step_time_gen",
         "step_time_train",
         "step_time_sync",
+        "peak_vram_gb",
     ]
 
     with open(csv_file, "w", newline="", encoding="utf-8") as cf:
@@ -863,16 +1046,18 @@ def main(config: dict | str | Path) -> dict[str, Any]:
                     ckpt_dir=ckpt_dir,
                     step=step,
                     model=model,
-                    behav_state_dict=behav_sd,
+                    behav_state_dict=behav_sd if k > 0 else None,
                     optimizer=optimizer,
                     opt_name=opt_name,
                     config=cfg,
                     min_free_gb=min_free_gb,
+                    k=k,
                 )
                 saved_ckpt_paths[step] = str(cp)
 
-            # Sync behavior weights theta_{t-k} into GPU behavior model and rollout engine (§6.3)
+            # Wake up rollout engine before weight sync and rollout generation
             t_sync_0 = time.perf_counter()
+            rollout_engine.wake_up()
             behav_model.load_state_dict(
                 {name: val.to(device=device, dtype=torch.float32) for name, val in behav_sd.items()},
                 strict=True,
@@ -894,16 +1079,11 @@ def main(config: dict | str | Path) -> dict[str, Any]:
             )
             step_time_gen = time.perf_counter() - t_gen_0
 
+            # Put vLLM to sleep(level=1) before training forward/backward to free GPU memory
+            rollout_engine.sleep(level=1)
+
             # Weight sync logprob consistency verification (§6.2)
             sync_max_diff, sync_mean_diff = rollout_engine.verify_logprob_sync(behav_model, rollout_batch)
-
-            # Extract m_{t-1} before optimizer step for online_C1 (§6.4, §6.5)
-            m_prev_dict, _, _ = extract_momentum_buffers(optimizer, model, opt_name)
-            prev_params = {
-                name: p.detach().clone()
-                for name, p in model.named_parameters()
-                if p.requires_grad
-            }
 
             # Forward & backward with global N_tok normalization
             t_train_0 = time.perf_counter()
@@ -921,41 +1101,37 @@ def main(config: dict | str | Path) -> dict[str, Any]:
                 use_bf16=use_bf16,
             )
 
-            grad_dict = {}
-            grad_norm_sq = 0.0
-            for name, p in model.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    grad_dict[name] = p.grad.detach()
-                    g64 = p.grad.detach().to(dtype=torch.float64)
-                    grad_norm_sq += float(torch.sum(g64 * g64).item())
-            grad_norm = float(np.sqrt(grad_norm_sq))
-            online_c1 = compute_online_c1(m_prev_dict, grad_dict)
+            # Compute grad_norm and online_C1 directly on GPU using optimizer state buffers (no CPU copies)
+            grad_norm, online_c1 = compute_grad_norm_and_online_c1_gpu(optimizer, model, opt_name)
 
-            optimizer.step()
-
-            update_norm_sq = 0.0
-            for name, p in model.named_parameters():
-                if p.requires_grad:
-                    diff64 = (p.detach() - prev_params[name]).to(dtype=torch.float64)
-                    update_norm_sq += float(torch.sum(diff64 * diff64).item())
-            update_norm = float(np.sqrt(update_norm_sq))
+            # Step optimizer and compute update_norm without cloning full model prev_params
+            update_norm = step_and_compute_update_norm(optimizer)
             step_time_train = time.perf_counter() - t_train_0
 
             # Periodic evaluation (§6.5)
             eval_acc = float("nan")
             if eval_every > 0 and (step % eval_every == 0 or step == steps - 1):
                 if backend_name == "vllm":
+                    rollout_engine.wake_up()
                     rollout_engine.sync_weights(model.state_dict())
                     ev = evaluate_gsm8k_vllm(rollout_engine.vllm_engine, eval_pool, max_new_tokens=max_new_tokens)
+                    rollout_engine.sleep(level=1)
                 else:
                     ev = evaluate_gsm8k_hf(model, tokenizer, eval_pool, max_new_tokens=max_new_tokens, device=device)
                 eval_acc = ev["eval_acc"]
+
+            peak_vram_gb = (
+                float(torch.cuda.max_memory_allocated(device) / (1024.0**3))
+                if device.type == "cuda" and torch.cuda.is_available()
+                else 0.0
+            )
 
             row = {
                 "step": step,
                 "loss": train_stats["loss"],
                 "reward_mean": float(np.mean(rollout_batch["rewards"])),
                 "zero_adv_frac": rollout_batch["zero_adv_frac"],
+                "dup_group_frac": rollout_batch["dup_group_frac"],
                 "resp_len_mean": rollout_batch["resp_len_mean"],
                 "grad_norm": grad_norm,
                 "update_norm": update_norm,
@@ -969,6 +1145,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
                 "step_time_gen": step_time_gen,
                 "step_time_train": step_time_train,
                 "step_time_sync": step_time_sync,
+                "peak_vram_gb": peak_vram_gb,
             }
             step_rows.append(row)
             writer.writerow(row)
@@ -976,8 +1153,9 @@ def main(config: dict | str | Path) -> dict[str, Any]:
 
             log_line = (
                 f"[step {step:03d}/{steps:03d}] loss={row['loss']:.4f} reward={row['reward_mean']:.3f} "
-                f"zero_adv={row['zero_adv_frac']:.2f} grad_norm={grad_norm:.4f} C1={online_c1:.4f} "
-                f"trunc={row['trunc_rate']:.4f} sync_max_diff={sync_max_diff:.2e} eval_acc={eval_acc:.3f}"
+                f"zero_adv={row['zero_adv_frac']:.2f} dup_grp={row['dup_group_frac']:.2f} "
+                f"grad_norm={grad_norm:.4f} C1={online_c1:.4f} trunc={row['trunc_rate']:.4f} "
+                f"sync_max_diff={sync_max_diff:.2e} vram={peak_vram_gb:.2f}GB eval_acc={eval_acc:.3f}"
             )
             with open(log_file, "a", encoding="utf-8") as lf:
                 lf.write(log_line + "\n")
@@ -997,11 +1175,14 @@ def main(config: dict | str | Path) -> dict[str, Any]:
         "steps": steps,
         "final_reward_mean": step_rows[-1]["reward_mean"] if step_rows else float("nan"),
         "final_eval_acc": step_rows[-1]["eval_acc"] if step_rows else float("nan"),
+        "mean_zero_adv_frac": float(np.mean([r["zero_adv_frac"] for r in step_rows])) if step_rows else 0.0,
+        "mean_dup_group_frac": float(np.mean([r["dup_group_frac"] for r in step_rows])) if step_rows else 0.0,
         "diverged": diverged,
         "mean_step_time_gen": float(np.mean([r["step_time_gen"] for r in step_rows])) if step_rows else 0.0,
         "mean_step_time_train": float(np.mean([r["step_time_train"] for r in step_rows])) if step_rows else 0.0,
         "mean_step_time_sync": float(np.mean([r["step_time_sync"] for r in step_rows])) if step_rows else 0.0,
         "max_sync_logprob_diff": float(np.max([r["sync_logprob_max_diff"] for r in step_rows])) if step_rows else 0.0,
+        "peak_vram_gb": float(np.max([r["peak_vram_gb"] for r in step_rows])) if step_rows else 0.0,
     }
     with open(summary_path, "w", newline="", encoding="utf-8") as sf:
         sw = csv.DictWriter(sf, fieldnames=list(summary_row.keys()))

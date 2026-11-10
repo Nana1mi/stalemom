@@ -49,7 +49,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
     k = int(cfg.get("k", 0))
     c_raw = cfg.get("c", float("inf"))
     c = float("inf") if (c_raw is None or str(c_raw).lower() in ("inf", "none")) else float(c_raw)
-    micro_batch_size = cfg.get("micro_batch_size", None)
+    micro_batch_size = int(cfg.get("micro_batch_size", 4))
 
     nested_cfg = cfg.get("nested_design", {})
     S = int(nested_cfg.get("S", cfg.get("diag_S", 16)))
@@ -117,6 +117,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
         device=device,
         vllm_cfg=cfg.get("vllm", {}),
         use_bf16=use_bf16,
+        seed=seed,
     )
 
     rng = np.random.default_rng(seed + 1000)
@@ -135,7 +136,9 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         step = int(payload["step"])
         model_sd = payload["model_state_dict"]
-        behav_sd = payload.get("behav_state_dict", model_sd)
+        behav_sd = payload.get("behav_state_dict")
+        if behav_sd is None:
+            behav_sd = model_sd
         m_dict_cpu = payload.get("momentum_buffer", {})
         norm_m = float(payload.get("norm_m", 0.0))
         if step == 0:
@@ -156,6 +159,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
             {name: val.to(device=device, dtype=torch.float32) for name, val in behav_sd.items()},
             strict=True,
         )
+        rollout_engine.wake_up()
         rollout_engine.sync_weights(behav_sd)
 
         acc = OnlineLLMDiagAccumulator(
@@ -168,6 +172,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
 
         rewards_all = []
         zero_adv_all = []
+        dup_grp_all = []
         trunc_all = []
         kl_all = []
 
@@ -176,6 +181,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
             set_items = prompt_sets[s_idx]
             for r_idx in range(R):
                 rollout_seed = seed + step * 10000 + s_idx * 100 + r_idx
+                rollout_engine.wake_up()
                 rb = rollout_engine.generate_group_rollouts(
                     items=set_items,
                     group_size=group_size,
@@ -184,6 +190,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
                     max_new_tokens=max_new_tokens,
                     seed=rollout_seed,
                 )
+                rollout_engine.sleep(level=1)
                 model.zero_grad(set_to_none=True)
                 st_mb = accumulate_grpo_tis_microbatches(
                     model=model,
@@ -210,6 +217,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
 
                 rewards_all.append(float(np.mean(rb["rewards"])))
                 zero_adv_all.append(rb["zero_adv_frac"])
+                dup_grp_all.append(rb.get("dup_group_frac", 0.0))
                 trunc_all.append(st_mb["trunc_rate"])
                 kl_all.append(st_mb["approx_kl"])
             acc.end_set()
@@ -243,6 +251,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
             "norm_m": norm_m,
             "reward_mean": float(np.mean(rewards_all)),
             "zero_adv_frac": float(np.mean(zero_adv_all)),
+            "dup_group_frac": float(np.mean(dup_grp_all)),
             "trunc_rate": float(np.mean(trunc_all)),
             "approx_kl": float(np.mean(kl_all)),
             "N_bar": res["N_bar"],

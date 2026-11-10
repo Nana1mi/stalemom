@@ -268,3 +268,322 @@ def test_online_llm_diag_accumulator_matches_nested_stats():
     for k in ["N_bar", "H_hat", "M", "var_total", "var_rollout", "var_prompt", "SNR_hat", "inner_m_h", "C1", "C2_hat", "C1_pred", "C1_pred_legacy"]:
         assert np.isclose(res_online[k], res_batch[k], rtol=1e-5, atol=1e-5), f"Mismatch on {k}: {res_online[k]} vs {res_batch[k]}"
     assert res_online["sketch_rel_err"] < 0.05
+
+
+def test_all_l0_to_l4_configs_have_micro_batch_size_4():
+    """Verify every L0–L4 YAML config file specifies micro_batch_size: 4."""
+    from pathlib import Path
+    import yaml
+
+    cfg_root = Path("llm/configs")
+    yaml_files = sorted(cfg_root.rglob("*.yaml"))
+    assert len(yaml_files) >= 6
+    for yf in yaml_files:
+        with open(yf, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        assert data.get("micro_batch_size") == 4, f"{yf} missing micro_batch_size: 4"
+
+
+def test_chunked_compute_response_logprobs_matches_naive_log_softmax():
+    """Verify chunked logsumexp + gather matches full fp32 log_softmax in forward values and backward grads."""
+    import torch
+    from llm.train import compute_response_logprobs
+
+    torch.manual_seed(3001)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    class TinyLM(torch.nn.Module):
+        def __init__(self, vocab_size: int = 128, hidden: int = 32):
+            super().__init__()
+            self.embed = torch.nn.Embedding(vocab_size, hidden)
+            self.proj = torch.nn.Linear(hidden, vocab_size, bias=True)
+
+        def forward(self, input_ids, attention_mask=None, **kwargs):
+            h = torch.tanh(self.embed(input_ids))
+            logits = self.proj(h)
+
+            class Out:
+                pass
+
+            out = Out()
+            out.logits = logits
+            return out
+
+    m_chunk = TinyLM().to(dev, dtype=torch.float32)
+    m_naive = TinyLM().to(dev, dtype=torch.float32)
+    m_naive.load_state_dict(m_chunk.state_dict())
+
+    B, L = 4, 15
+    input_ids = torch.randint(0, 128, (B, L), device=dev)
+    attention_mask = torch.ones((B, L), dtype=torch.long, device=dev)
+    weights = torch.randn((B, L - 1), dtype=torch.float32, device=dev)
+
+    # 1. Chunked logsumexp + gather with small chunk_size=4
+    lp_chunk = compute_response_logprobs(
+        m_chunk, input_ids, attention_mask, use_bf16=False, chunk_size=4
+    )
+    loss_chunk = (lp_chunk * weights).sum()
+    loss_chunk.backward()
+
+    # 2. Naive full (B, L-1, V) fp32 log_softmax + gather
+    logits_naive = m_naive(input_ids=input_ids, attention_mask=attention_mask).logits[:, :-1, :]
+    log_probs_all = torch.log_softmax(logits_naive.to(dtype=torch.float32), dim=-1)
+    lp_naive = torch.gather(log_probs_all, dim=-1, index=input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+    loss_naive = (lp_naive * weights).sum()
+    loss_naive.backward()
+
+    torch.testing.assert_close(lp_chunk, lp_naive, rtol=1e-6, atol=1e-6)
+    for (n1, p1), (n2, p2) in zip(m_chunk.named_parameters(), m_naive.named_parameters()):
+        assert n1 == n2
+        torch.testing.assert_close(p1.grad, p2.grad, rtol=1e-6, atol=1e-6)
+
+
+def test_step_and_compute_update_norm_and_gpu_online_c1_no_clone_or_cpu_copy():
+    """Verify GPU-direct online_C1 and per-parameter step_and_compute_update_norm match full-clone reference."""
+    import torch
+    from llm.train import (
+        build_optimizer,
+        compute_grad_norm_and_online_c1_gpu,
+        compute_online_c1,
+        extract_momentum_buffers,
+        step_and_compute_update_norm,
+    )
+
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for opt_name in ["sgd", "sgd_mom", "adamw"]:
+        torch.manual_seed(4001)
+        m_new = torch.nn.Sequential(
+            torch.nn.Linear(16, 24),
+            torch.nn.Tanh(),
+            torch.nn.Linear(24, 8),
+        ).to(dev, dtype=torch.float32)
+        m_ref = torch.nn.Sequential(
+            torch.nn.Linear(16, 24),
+            torch.nn.Tanh(),
+            torch.nn.Linear(24, 8),
+        ).to(dev, dtype=torch.float32)
+        m_ref.load_state_dict(m_new.state_dict())
+
+        opt_new = build_optimizer(m_new, opt_name=opt_name, lr=0.01, momentum=0.9)
+        opt_ref = build_optimizer(m_ref, opt_name=opt_name, lr=0.01, momentum=0.9)
+
+        for step_idx in range(3):
+            x = torch.randn((6, 16), device=dev, dtype=torch.float32)
+            opt_new.zero_grad(set_to_none=True)
+            opt_ref.zero_grad(set_to_none=True)
+
+            loss_new = (m_new(x) ** 2).mean()
+            loss_ref = (m_ref(x) ** 2).mean()
+            loss_new.backward()
+            loss_ref.backward()
+
+            # Reference: CPU buffer extraction + full prev_params clone
+            m_prev_ref, _, _ = extract_momentum_buffers(opt_ref, m_ref, opt_name)
+            prev_params_ref = {n: p.detach().clone() for n, p in m_ref.named_parameters()}
+            grad_dict_ref = {n: p.grad.detach() for n, p in m_ref.named_parameters()}
+            c1_ref = compute_online_c1(m_prev_ref, grad_dict_ref)
+            opt_ref.step()
+            upd_ref_sq = sum(
+                float(torch.sum((p.detach() - prev_params_ref[n]).to(torch.float64) ** 2).item())
+                for n, p in m_ref.named_parameters()
+            )
+            upd_ref = float(np.sqrt(upd_ref_sq))
+
+            # New: GPU-direct online_C1 + memory-free step_and_compute_update_norm
+            grad_norm_new, c1_new = compute_grad_norm_and_online_c1_gpu(opt_new, m_new, opt_name)
+            upd_new = step_and_compute_update_norm(opt_new)
+
+            assert np.isclose(upd_new, upd_ref, rtol=1e-12, atol=1e-12)
+            if np.isnan(c1_ref):
+                assert np.isnan(c1_new)
+            else:
+                assert np.isclose(c1_new, c1_ref, rtol=1e-6, atol=1e-6)
+            for p_n, p_r in zip(m_new.parameters(), m_ref.parameters()):
+                torch.testing.assert_close(p_n, p_r, rtol=0.0, atol=0.0)
+
+
+def test_save_checkpoint_omits_behav_state_dict_when_k0_and_includes_when_k_gt_0(tmp_path):
+    """Verify k=0 checkpoint omits behav_state_dict while k>0 checkpoint saves behav_state_dict."""
+    import torch
+    from llm.train import build_optimizer, save_checkpoint
+
+    model = torch.nn.Linear(8, 4)
+    opt = build_optimizer(model, "sgd_mom", lr=0.01, momentum=0.9)
+    behav_sd = {k: v.clone() for k, v in model.state_dict().items()}
+
+    p_k0 = save_checkpoint(
+        ckpt_dir=tmp_path / "k0",
+        step=0,
+        model=model,
+        behav_state_dict=behav_sd,
+        optimizer=opt,
+        opt_name="sgd_mom",
+        config={"k": 0},
+        min_free_gb=0.01,
+        k=0,
+    )
+    payload_k0 = torch.load(p_k0, map_location="cpu", weights_only=False)
+    assert "behav_state_dict" not in payload_k0
+    assert "model_state_dict" in payload_k0
+
+    p_k2 = save_checkpoint(
+        ckpt_dir=tmp_path / "k2",
+        step=2,
+        model=model,
+        behav_state_dict=behav_sd,
+        optimizer=opt,
+        opt_name="sgd_mom",
+        config={"k": 2},
+        min_free_gb=0.01,
+        k=2,
+    )
+    payload_k2 = torch.load(p_k2, map_location="cpu", weights_only=False)
+    assert "behav_state_dict" in payload_k2
+
+
+def test_vllm_sleep_wake_and_engine_seed_and_dup_group_frac(monkeypatch):
+    """Verify dup_group_frac calculation, vLLM sleep(level=1)/wake_up(), and engine-level seed without per-request seed."""
+    import sys
+    import types
+    import torch
+    from llm.data import GSM8KItem
+    from llm.train import RolloutBackend, compute_dup_group_frac
+
+    # 1. Test compute_dup_group_frac directly
+    # Group 0: all 4 identical -> duplicate group
+    # Group 1: 3 identical, 1 different -> not all identical
+    resps = [
+        [1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3],
+        [4, 5], [4, 5], [4, 5], [4, 6],
+    ]
+    assert np.isclose(compute_dup_group_frac(resps, group_size=4), 0.5)
+
+    # 2. Mock vllm module to test RolloutBackend vllm lifecycle without a Linux vLLM server
+    events = []
+    captured_llm_kwargs = {}
+    captured_sp_kwargs = []
+
+    class DummySamplingParams:
+        def __init__(self, **kwargs):
+            captured_sp_kwargs.append(kwargs)
+            self.kwargs = kwargs
+
+    class DummyComp:
+        def __init__(self, token_ids, text):
+            self.token_ids = token_ids
+            self.text = text
+            self.logprobs = [{tid: types.SimpleNamespace(logprob=-0.5)} for tid in token_ids]
+
+    class DummyReqOut:
+        def __init__(self, prompt_token_ids, outputs):
+            self.prompt_token_ids = prompt_token_ids
+            self.outputs = outputs
+
+    class DummyLLM:
+        def __init__(self, **kwargs):
+            captured_llm_kwargs.update(kwargs)
+            events.append(("init", kwargs.get("seed")))
+
+        def sleep(self, level: int = 1):
+            events.append(("sleep", level))
+
+        def wake_up(self):
+            events.append(("wake_up", None))
+
+        def apply_model(self, fn):
+            dummy_model = types.SimpleNamespace(
+                load_weights=lambda w: events.append(("load_weights_apply_model", len(w)))
+            )
+            return fn(dummy_model)
+
+        def generate(self, prompts, sp, use_tqdm=False):
+            events.append(("generate", len(prompts)))
+            outs = []
+            for idx, _ in enumerate(prompts):
+                if idx == 0:
+                    # All 4 responses identical in group 0
+                    comps = [DummyComp([10, 11], "\\boxed{3}") for _ in range(sp.kwargs["n"])]
+                else:
+                    # Mixed responses in group 1
+                    comps = [
+                        DummyComp([10, 11 + g], "\\boxed{3}" if g % 2 == 0 else "\\boxed{4}")
+                        for g in range(sp.kwargs["n"])
+                    ]
+                outs.append(DummyReqOut([1, 2, 3], comps))
+            return outs
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = DummyLLM
+    fake_vllm.SamplingParams = DummySamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    dummy_tok = types.SimpleNamespace(pad_token_id=0, eos_token_id=2)
+    rb = RolloutBackend(
+        backend="vllm",
+        model_name="dummy/model",
+        tokenizer=dummy_tok,
+        device="cpu",
+        vllm_cfg={"enable_sleep_mode": True, "gpu_memory_utilization": 0.3},
+        use_bf16=False,
+        seed=1234,
+    )
+
+    # Engine-level seed must be passed to LLM(...)
+    assert captured_llm_kwargs["seed"] == 1234
+
+    # Sleep -> sync_weights should auto wake_up and use apply_model fallback
+    rb.sleep(level=1)
+    assert rb._is_sleeping is True
+    rb.sync_weights({"w": torch.ones(4)})
+    assert rb._is_sleeping is False
+
+    # Sleep -> generate_group_rollouts should auto wake_up and NOT pass seed to SamplingParams
+    rb.sleep(level=1)
+    items = [
+        GSM8KItem(idx=0, question="q0", ground_truth="3", prompt_text="p0"),
+        GSM8KItem(idx=1, question="q1", ground_truth="3", prompt_text="p1"),
+    ]
+    batch = rb.generate_group_rollouts(
+        items=items,
+        group_size=4,
+        temperature=1.0,
+        top_p=1.0,
+        max_new_tokens=16,
+        seed=9999,
+    )
+    rb.sleep(level=1)
+
+    assert "seed" not in captured_sp_kwargs[-1]
+    assert np.isclose(batch["dup_group_frac"], 0.5)
+    assert ("sleep", 1) in events
+    assert ("wake_up", None) in events
+    assert ("load_weights_apply_model", 1) in events
+
+
+def test_run_l0_pipeline_steps_and_snr_recommendation(tmp_path):
+    """Verify run_l0 helpers (recommend_l2_k_from_snr, estimate_l1_to_l4_gpu_hours, step1_record_environment)."""
+    from llm.run_l0 import (
+        estimate_l1_to_l4_gpu_hours,
+        recommend_l2_k_from_snr,
+        step1_record_environment,
+    )
+
+    pinned = step1_record_environment(tmp_path)
+    assert "torch" in pinned
+    assert (tmp_path / "pinned_versions.txt").exists()
+
+    rec_high = recommend_l2_k_from_snr(snr_hat=0.5, target_cv=0.25, r_rep=4)
+    assert rec_high["recommended_K"] >= 64
+    assert rec_high["recommended_S"] % 2 == 0
+
+    rec_low = recommend_l2_k_from_snr(snr_hat=0.05, target_cv=0.25, r_rep=4)
+    assert rec_low["recommended_K"] > rec_high["recommended_K"]
+
+    est = estimate_l1_to_l4_gpu_hours(mean_step_sec=2.0, recommended_k_l2=64)
+    assert est["total_L1_to_L4_core_gpu_hours"] > 0.0
+    assert np.isclose(
+        est["total_L1_to_L4_core_gpu_hours"],
+        est["L1_gpu_hours"] + est["L2_gpu_hours"] + est["L3_gpu_hours"] + est["L4_core_gpu_hours"],
+    )
+
+

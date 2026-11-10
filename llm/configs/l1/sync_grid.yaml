@@ -1,0 +1,32 @@
+# SPEC E5 §8 — L1 Synchronous Training (SGD vs SGD+mom)
+phase: l1
+model: Qwen/Qwen3-0.6B
+enable_thinking: false
+master_weights_dtype: fp32
+compute_dtype: bf16
+gradient_checkpointing: true
+k: 0
+c: inf
+steps: 150
+eval_every: 50
+save_checkpoints_at: [0, 50, 100]
+rollout:
+  prompts_per_step: 32
+  group_size: 4
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 512
+optimizers:
+  sgd:
+    momentum: 0.0
+    dampening: 0.0
+    lr_grid: [0.03, 0.1, 0.3]
+  sgd_mom:
+    momentum: 0.9
+    dampening: 0.0
+    # Effective step size lr / (1 - beta) matches [0.03, 0.1, 0.3]
+    lr_grid: [0.003, 0.01, 0.03]
+seeds:
+  initial: [42]
+  best_lr_extra: [43]
+output_dir: results/e5/l1

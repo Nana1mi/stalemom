@@ -1,0 +1,23 @@
+# SPEC E5 §9 — L2 Frozen Checkpoint Gradient Diagnostics
+phase: l2
+model: Qwen/Qwen3-0.6B
+enable_thinking: false
+master_weights_dtype: fp32
+compute_dtype: bf16
+checkpoints: [0, 50, 100]
+k: 0
+c: inf
+nested_design:
+  S: 16
+  R: 4
+  prompts_per_set: 32
+  group_size: 4
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 512
+sketch:
+  D: 4194304
+  max_rel_err: 0.05
+delete_checkpoint_after_diag: true
+min_free_disk_gb: 10.0
+output_dir: results/e5/l2

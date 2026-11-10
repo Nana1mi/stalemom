@@ -1,0 +1,24 @@
+# SPEC E5 §10 — L3 Asynchronous Training & Diagnostics
+phase: l3
+model: Qwen/Qwen3-0.6B
+enable_thinking: false
+master_weights_dtype: fp32
+compute_dtype: bf16
+gradient_checkpointing: true
+steps: 150
+eval_every: 50
+optimizer_from_l1_best: sgd_mom
+grid:
+  k_values: [4, 8]
+  c_values: [1.2, inf]
+seeds:
+  default: [42]
+  extra_k8_c1_2: [43]
+inline_diag:
+  steps: [50, 100]
+  S: 8
+  R: 4
+  prompts_per_set: 32
+  group_size: 4
+  sketch_dim: 4194304
+output_dir: results/e5/l3

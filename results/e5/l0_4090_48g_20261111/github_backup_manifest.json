@@ -710,5 +710,6 @@
       "bytes": 321,
       "sha256": "8e58729f9678234f5d4b4075fa2b91c800f21f85c51ef9e41e22056f939e3744"
     }
-  ]
+  ],
+  "result_byte_preservation": "Scoped .gitattributes -text prevents line-ending conversion of this result backup."
 }

@@ -1,0 +1,2 @@
+# Preserve the verified L0 backup bytes on every platform.
+results/e5/l0_4090_48g_20261111/** -text

@@ -1,0 +1,65 @@
+{
+  "status": "complete",
+  "result": {
+    "diag_rows": [
+      {
+        "step": 9,
+        "S": 4,
+        "R": 2,
+        "prompts_per_set": 32,
+        "group_size": 4,
+        "k": 0,
+        "c": Infinity,
+        "norm_m": 1.8949716689683045,
+        "reward_mean": 0.58984375,
+        "zero_adv_frac": 0.5859375,
+        "dup_group_frac": 0.0,
+        "trunc_rate": 0.0,
+        "approx_kl": 0.0,
+        "N_bar": 0.610394852092282,
+        "N_bar_jk_se": 0.0318968114675505,
+        "H_hat": 0.019275597029219917,
+        "H_hat_jk_se": 0.006326295175109715,
+        "H_sketch": 0.019334195392534607,
+        "sketch_rel_err": 0.0030400284476720194,
+        "M": 0.03577402694006862,
+        "M_jk_se": 0.008618079262662486,
+        "var_total": 0.5911192550630621,
+        "var_total_jk_se": 0.033941797125863725,
+        "var_rollout": 0.5746208251522134,
+        "var_rollout_jk_se": 0.034544278107912114,
+        "var_prompt": 0.016498429910848704,
+        "var_prompt_jk_se": 0.004787780147154388,
+        "prompt_var_frac": 0.027910493135752463,
+        "rollout_var_frac": 0.9720895068642476,
+        "SNR_hat": 0.03260864345750934,
+        "SNR_hat_jk_se": 0.011250732702269298,
+        "C1": -0.046197884943326065,
+        "C1_jk_se": 0.013590643382890398,
+        "C1_pred": -0.04635753882446859,
+        "C1_pred_jk_se": 0.013674894895965625,
+        "C1_pred_legacy": -0.04666806544633723,
+        "C1_pred_legacy_jk_se": 0.013752803104858312,
+        "C2_hat": -0.2608686451193249,
+        "C2_hat_jk_se": 0.08964409098681644,
+        "diag_time_sec": 1438.15202073,
+        "peak_vram_gb": 22.701164722442627,
+        "nvidia_smi_peak_gb": 29.208984375
+      }
+    ],
+    "c3_rows": [
+      {
+        "step_t": 9,
+        "step_s": 9,
+        "C3_hat": 1.0,
+        "H_hat_t": 0.019275597029219917,
+        "H_hat_s": 0.019275597029219917
+      }
+    ],
+    "diag_summary_csv": "/root/work/results/e5/l0/diag_step9/diag_summary.csv",
+    "c3_matrix_csv": "/root/work/results/e5/l0/diag_step9/c3_matrix.csv"
+  },
+  "physical_peak_gib": 29.208984375,
+  "elapsed_seconds": 1450.3061710149996,
+  "worker_exit_code": 0
+}

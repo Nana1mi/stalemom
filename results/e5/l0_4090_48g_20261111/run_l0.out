@@ -1,0 +1,6 @@
+[L0] environment completed; physical peak=0.0 GiB
+[L0] train_k0_attempt0 completed; physical peak=20.359375 GiB
+[L0] train_k2_attempt0 completed; physical peak=20.39453125 GiB
+[L0] throughput_mb8 completed; physical peak=18.658203125 GiB
+[L0] diag_step0 completed; physical peak=22.990234375 GiB
+[L0] diag_step9 completed; physical peak=29.208984375 GiB

@@ -11,22 +11,21 @@ Executes the 5-step L0 protocol in strict order, stopping immediately and report
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import time
 from typing import Any
 
 import numpy as np
 import torch
-import yaml
 
 from llm.data import load_gsm8k_pools
-from llm.run_diag import run_checkpoint_diagnostics
 from llm.train import (
     RolloutBackend,
-    main as train_main,
     write_llm_env_file,
 )
 
@@ -78,11 +77,12 @@ def step1_record_environment(out_dir: Path) -> dict[str, str]:
     except Exception as e:
         vllm_ver = f"not_installed ({e})"
 
-    cuda_ver = str(torch.version.cuda) if torch.cuda.is_available() else "cpu"
-    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
+    cuda_available = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    cuda_ver = str(torch.version.cuda) if cuda_available else "cpu"
+    gpu_name = torch.cuda.get_device_name(0) if cuda_available else "none"
     vram_total_gb = (
         float(torch.cuda.get_device_properties(0).total_memory / (1024.0**3))
-        if torch.cuda.is_available()
+        if cuda_available
         else 0.0
     )
 
@@ -93,6 +93,8 @@ def step1_record_environment(out_dir: Path) -> dict[str, str]:
         "cuda": cuda_ver,
         "gpu_name": gpu_name,
         "vram_total_gb": f"{vram_total_gb:.2f}",
+        "driver": subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], capture_output=True, text=True).stdout.strip() if shutil.which("nvidia-smi") else "unavailable",
+        "git_commit": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip() if shutil.which("git") else "unavailable",
     }
     pin_lines = [f"{k}=={v}" for k, v in pinned.items()]
     (out_dir / "pinned_versions.txt").write_text("\n".join(pin_lines) + "\n", encoding="utf-8")
@@ -169,6 +171,7 @@ def step2_test_weight_sync(
     rollout_engine.sleep(level=1)
 
     max_diff, mean_diff = rollout_engine.verify_logprob_sync(hf_model, batch)
+    interface = rollout_engine.sync_interface
     del rollout_engine, hf_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -176,6 +179,7 @@ def step2_test_weight_sync(
     passed = bool(np.isfinite(mean_diff) and mean_diff < tol_mean_diff)
     return {
         "backend": backend_name,
+        "sync_interface": interface,
         "sync_time_sec": float(sync_sec),
         "logprob_max_diff": float(max_diff),
         "logprob_mean_diff": float(mean_diff),
@@ -221,133 +225,9 @@ def estimate_l1_to_l4_gpu_hours(
 
 
 def run_l0_pipeline(config_path: str = "llm/configs/l0/smoke.yaml", backend_override: str | None = None) -> dict[str, Any]:
-    with open(config_path, "r", encoding="utf-8") as f:
-        base_cfg = yaml.safe_load(f)
-
-    out_dir = Path(base_cfg.get("output_dir", "results/e5/l0"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(base_cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    use_bf16 = bool(base_cfg.get("compute_dtype", "bf16") == "bf16" and device.type == "cuda")
-    seed = int(base_cfg.get("data", {}).get("seed", base_cfg.get("seed", 42)))
-    dataset_name = base_cfg.get("data", {}).get("dataset", base_cfg.get("dataset", "openai/gsm8k"))
-    max_new_tokens = int(base_cfg.get("rollout", {}).get("max_new_tokens", 512))
-    backend_name = backend_override or base_cfg.get("rollout_backend", "vllm")
-
-    # Step 1: Record environment and pin versions
-    pinned_env = step1_record_environment(out_dir)
-
-    # Step 2: Standalone weight synchronization test under random weight perturbation
-    sync_res = step2_test_weight_sync(
-        model_name=base_cfg["model"],
-        backend_name=backend_name,
-        device=device,
-        vllm_cfg=base_cfg.get("vllm", {}),
-        use_bf16=use_bf16,
-        seed=seed,
-        dataset_name=dataset_name,
-        max_new_tokens=min(max_new_tokens, 64),
-        tol_mean_diff=0.02,
-    )
-    if not sync_res["passed"]:
-        raise RuntimeError(
-            f"[L0 Step 2 FAILED] Weight sync logprob mean diff = {sync_res['logprob_mean_diff']:.6f} >= 0.02. Stopping."
-        )
-
-    # Step 3: Run 10 steps of SGD+mom for k in {0, 2}
-    smoke_cfg = base_cfg.get("smoke_checks", {})
-    k_values = smoke_cfg.get("k_values", [0, 2])
-    steps = int(smoke_cfg.get("steps", 10))
-    max_vram_limit = float(smoke_cfg.get("max_vram_gb", 22.0))
-    step3_runs = {}
-
-    for k_val in k_values:
-        run_cfg = copy.deepcopy(base_cfg)
-        run_cfg["rollout_backend"] = backend_name
-        run_cfg["k"] = int(k_val)
-        run_cfg["c"] = float("inf") if int(k_val) == 0 else float(smoke_cfg.get("c", 1.2))
-        run_cfg["steps"] = steps
-        run_cfg["optimizer"] = smoke_cfg.get("optimizer", "sgd_mom")
-        run_cfg["momentum"] = float(smoke_cfg.get("momentum", 0.9))
-        run_cfg["lr"] = float(smoke_cfg.get("lr", 0.01))
-        run_cfg["micro_batch_size"] = int(base_cfg.get("micro_batch_size", 4))
-        run_cfg["save_checkpoints_at"] = [0, steps - 1]
-        run_cfg["eval_every"] = 0
-        run_cfg["output_dir"] = str(out_dir / f"train_k{k_val}")
-
-        res_k = train_main(run_cfg)
-        summary_k = res_k["summary"]
-        step3_runs[f"k={k_val}"] = summary_k
-
-        if summary_k["diverged"]:
-            raise RuntimeError(f"[L0 Step 3 FAILED] Training diverged at k={k_val}. Stopping.")
-        if summary_k["peak_vram_gb"] > max_vram_limit:
-            raise RuntimeError(
-                f"[L0 Step 3 FAILED] Peak VRAM {summary_k['peak_vram_gb']:.2f} GB > {max_vram_limit} GB at k={k_val}. Stopping."
-            )
-
-    # Step 4: Run mini-L2 (S=4, R=2) on k=0 final checkpoint
-    mini_l2_cfg = smoke_cfg.get("mini_l2", {})
-    diag_cfg = copy.deepcopy(base_cfg)
-    diag_cfg["rollout_backend"] = backend_name
-    diag_cfg["k"] = 0
-    diag_cfg["c"] = float("inf")
-    diag_cfg["micro_batch_size"] = int(base_cfg.get("micro_batch_size", 4))
-    diag_cfg["checkpoint_dir"] = str(out_dir / "train_k0" / "checkpoints")
-    diag_cfg["checkpoints"] = [steps - 1]
-    diag_cfg["nested_design"] = {
-        "S": int(mini_l2_cfg.get("S", 4)),
-        "R": int(mini_l2_cfg.get("R", 2)),
-        "prompts_per_set": int(base_cfg.get("rollout", {}).get("prompts_per_step", 32)),
-        "group_size": int(base_cfg.get("rollout", {}).get("group_size", 4)),
-        "temperature": float(base_cfg.get("rollout", {}).get("temperature", 1.0)),
-        "top_p": float(base_cfg.get("rollout", {}).get("top_p", 1.0)),
-        "max_new_tokens": max_new_tokens,
-    }
-    diag_cfg["sketch"] = {
-        "D": int(mini_l2_cfg.get("sketch_dim", 4194304)),
-    }
-    diag_cfg["output_dir"] = str(out_dir / "mini_l2")
-
-    diag_res = run_checkpoint_diagnostics(diag_cfg)
-    diag_row = diag_res["diag_rows"][-1]
-    max_sketch_err = float(mini_l2_cfg.get("max_sketch_rel_err", 0.05))
-    if diag_row["sketch_rel_err"] >= max_sketch_err:
-        raise RuntimeError(
-            f"[L0 Step 4 FAILED] CountSketch rel_err = {diag_row['sketch_rel_err']:.4f} >= {max_sketch_err}. Stopping."
-        )
-
-    k_rec = recommend_l2_k_from_snr(diag_row["SNR_hat"])
-
-    # Step 5: Estimate GPU hours for L1–L4
-    k2_sum = step3_runs.get("k=2", step3_runs["k=0"])
-    mean_step_sec = (
-        k2_sum["mean_step_time_gen"]
-        + k2_sum["mean_step_time_train"]
-        + k2_sum["mean_step_time_sync"]
-    )
-    gpu_hours = estimate_l1_to_l4_gpu_hours(
-        mean_step_sec=mean_step_sec,
-        recommended_k_l2=k_rec["recommended_K"],
-    )
-
-    full_report = {
-        "step1_env": pinned_env,
-        "step2_weight_sync": sync_res,
-        "step3_runs": step3_runs,
-        "step4_mini_l2": {
-            "SNR_hat": diag_row["SNR_hat"],
-            "sketch_rel_err": diag_row["sketch_rel_err"],
-            "H_hat": diag_row["H_hat"],
-            "N_bar": diag_row["N_bar"],
-            "C1": diag_row["C1"],
-            "C1_pred": diag_row["C1_pred"],
-            "C2_hat": diag_row["C2_hat"],
-            "k_recommendation": k_rec,
-        },
-        "step5_gpu_hour_estimates": gpu_hours,
-    }
-    (out_dir / "l0_summary.json").write_text(json.dumps(full_report, indent=2), encoding="utf-8")
-    return full_report
+    """Run only L0, isolating CUDA stages and preserving failures for review."""
+    from llm.l0_pipeline import run_l0_pipeline as execute
+    return execute(config_path, backend_override)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,57 @@
+{
+  "phase": "l0",
+  "model": "Qwen/Qwen3-0.6B",
+  "enable_thinking": false,
+  "master_weights_dtype": "fp32",
+  "compute_dtype": "bf16",
+  "gradient_checkpointing": true,
+  "micro_batch_size": 4,
+  "vllm": {
+    "enable_sleep_mode": true,
+    "gpu_memory_utilization": 0.2,
+    "enforce_eager": true,
+    "max_model_len": 4096,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 512,
+    "enable_chunked_prefill": true,
+    "sync_method": "apply_model"
+  },
+  "data": {
+    "dataset": "openai/gsm8k",
+    "train_pool_size": 1024,
+    "eval_pool_size": 500,
+    "seed": 42
+  },
+  "rollout": {
+    "prompts_per_step": 32,
+    "group_size": 4,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_new_tokens": 512
+  },
+  "smoke_checks": {
+    "steps": 10,
+    "optimizer": "sgd_mom",
+    "momentum": 0.9,
+    "dampening": 0.0,
+    "lr": 0.01,
+    "k_values": [
+      0,
+      2
+    ],
+    "c": 1.2,
+    "max_vram_gb": 40.0,
+    "oom_gpu_memory_utilization": 0.15,
+    "throughput_probe": true,
+    "mini_l2": {
+      "S": 4,
+      "R": 2,
+      "sketch_dim": 4194304,
+      "max_sketch_rel_err": 0.05
+    }
+  },
+  "output_dir": "results/e5/l0",
+  "environment_min_free_gib": 70.0,
+  "gpu_price_yuan_per_hour": 2.68,
+  "rollout_backend": "vllm"
+}

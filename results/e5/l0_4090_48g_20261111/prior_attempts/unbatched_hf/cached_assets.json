@@ -1,0 +1,23 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "model_type": "qwen3",
+  "vocab_size": 151669,
+  "max_prompt_tokens_in_fixed_pools": 231,
+  "max_new_tokens": 512,
+  "max_model_len": 4096,
+  "dataset": {
+    "repo": "openai/gsm8k",
+    "config": "main",
+    "splits": {
+      "train": {
+        "rows": 7473,
+        "fingerprint": "c6f812ae33c9159d"
+      },
+      "test": {
+        "rows": 1319,
+        "fingerprint": "59ec1b7f9357c7a2"
+      }
+    }
+  },
+  "disk_free_bytes_before_l0": 79125778432
+}

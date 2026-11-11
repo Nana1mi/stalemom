@@ -1,0 +1,2 @@
+check,target,value,passed
+vllm_weight_sync,mean absolute logprob difference < 0.02,,False

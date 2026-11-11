@@ -1,0 +1,19 @@
+{
+  "training": [
+    {
+      "k": 0,
+      "steps": 10,
+      "logged_phase_sum_seconds": 1558.234601940997,
+      "worker_elapsed_seconds": 1618.3632285200001,
+      "unallocated_worker_seconds": 60.12862657900314
+    },
+    {
+      "k": 2,
+      "steps": 10,
+      "logged_phase_sum_seconds": 1585.5696915959998,
+      "worker_elapsed_seconds": 1667.359228661,
+      "unallocated_worker_seconds": 81.78953706500033
+    }
+  ],
+  "cost_estimation_limitations": "Future training estimates use the logged generation+training+sync times. Model initialization, checkpoint IO, logprob verification and other overhead outside these phase timers are excluded. Diagnostic estimates use measured diag_time_sec. Future k4/k8 training is approximated by the measured k2 baseline; their CPU snapshot/IO overhead was not measured. The microbatch probe is a short raw timing comparison, not a controlled equal-token benchmark."
+}

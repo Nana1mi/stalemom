@@ -1,0 +1,12 @@
+{
+  "basis": "Early projection from completed HF k0 CSV rows; later lengths and diagnostic overhead may differ.",
+  "completed_k0_rows": 1,
+  "mean_step_seconds": 389.22364341,
+  "assumed_training_batches": 20,
+  "assumed_diag_batches": 16,
+  "assumed_optional_microbatch8_probe_steps": 3,
+  "total_equivalent_batches": 39,
+  "projected_l0_hours": 4.216589470275,
+  "projected_l0_cost_yuan": 11.300459780337,
+  "price_yuan_per_hour": 2.68
+}

@@ -1,0 +1,14 @@
+{
+  "status": "complete",
+  "result": {
+    "backend": "vllm",
+    "sync_interface": "LLM.apply_model",
+    "sync_time_sec": 3.5848590270002205,
+    "logprob_max_diff": 3.5473339557647705,
+    "logprob_mean_diff": 0.5818749666213989,
+    "tol_mean_diff": 0.02,
+    "dup_group_frac": 0.0,
+    "passed": false
+  },
+  "physical_peak_gib": 9.521484375
+}

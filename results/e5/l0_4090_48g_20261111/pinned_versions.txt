@@ -1,0 +1,8 @@
+torch==2.6.0+cu124
+vllm==0.8.5
+transformers==4.51.3
+cuda==12.4
+gpu_name==NVIDIA GeForce RTX 4090
+vram_total_gb==47.50
+driver==550.90.07
+git_commit==67932fe6fb982e4fc2d7d60b5ae4ceec7b13e216

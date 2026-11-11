@@ -1,0 +1,1553 @@
+diff --git a/.gitignore b/.gitignore
+index 2f77088..3ce208a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,3 +16,6 @@ results/e5/l0_local_verify/tiny_model/
+ *.fls
+ *.fdb_latexmk
+ *.synctex.gz
++
++# Local access instructions contain a live server password.
++/CODEX_L0_4090_48G.md
+diff --git a/llm/configs/l0/smoke.yaml b/llm/configs/l0/smoke.yaml
+index 0270ebf..b3fde66 100644
+--- a/llm/configs/l0/smoke.yaml
++++ b/llm/configs/l0/smoke.yaml
+@@ -8,7 +8,12 @@ gradient_checkpointing: true
+ micro_batch_size: 4
+ vllm:
+   enable_sleep_mode: true
+-  gpu_memory_utilization: 0.30
++  gpu_memory_utilization: 0.20
++  enforce_eager: true
++  max_model_len: 4096
++  max_num_seqs: 16
++  max_num_batched_tokens: 512
++  enable_chunked_prefill: true
+ data:
+   dataset: openai/gsm8k
+   train_pool_size: 1024
+@@ -16,6 +21,7 @@ data:
+   seed: 42
+ rollout:
+   prompts_per_step: 32
++  hf_batch_prompts: 4
+   group_size: 4
+   temperature: 1.0
+   top_p: 1.0
+@@ -28,10 +34,14 @@ smoke_checks:
+   lr: 0.01
+   k_values: [0, 2]
+   c: 1.2
+-  max_vram_gb: 22.0
++  max_vram_gb: 40.0
++  oom_gpu_memory_utilization: 0.15
++  throughput_probe: true
+   mini_l2:
+     S: 4
+     R: 2
+     sketch_dim: 4194304
+     max_sketch_rel_err: 0.05
+ output_dir: results/e5/l0
++environment_min_free_gib: 70.0
++gpu_price_yuan_per_hour: 2.68
+diff --git a/llm/diag.py b/llm/diag.py
+index b0a7587..a6bef8e 100644
+--- a/llm/diag.py
++++ b/llm/diag.py
+@@ -4,6 +4,7 @@ from dataclasses import dataclass
+ import hashlib
+ import numpy as np
+ import torch
++from llm.runtime import tensor_inner64
+ 
+ 
+ class CountSketch:
+@@ -165,8 +166,7 @@ class OnlineLLMDiagAccumulator:
+                 g_fp32 = g.detach().to(device=self.device, dtype=torch.float32)
+ 
+             # Scalar norm squared accumulated in float64
+-            g_f64 = g_fp32.to(dtype=torch.float64)
+-            n_val += float(torch.sum(g_f64 * g_f64).item())
++            n_val += float(tensor_inner64(g_fp32).item())
+ 
+             if m_dict is not None and name in m_dict and self.norm_m > 0.0:
+                 m_t = m_dict[name]
+@@ -174,7 +174,7 @@ class OnlineLLMDiagAccumulator:
+                     m_fp32 = torch.as_tensor(m_t, dtype=torch.float32, device=self.device)
+                 else:
+                     m_fp32 = m_t.detach().to(device=self.device, dtype=torch.float32)
+-                d_val += float(torch.sum(m_fp32.to(dtype=torch.float64) * g_f64).item())
++                d_val += float(tensor_inner64(m_fp32, g_fp32).item())
+ 
+             # Vector accumulation in GPU fp32
+             if name not in self._cur_Ts:
+@@ -196,8 +196,7 @@ class OnlineLLMDiagAccumulator:
+         norm_sq_Ts = 0.0
+         target_half = self.sum_A if self._cur_s < (self.S // 2) else self.sum_B
+         for name, ts in self._cur_Ts.items():
+-            ts_f64 = ts.to(dtype=torch.float64)
+-            norm_sq_Ts += float(torch.sum(ts_f64 * ts_f64).item())
++            norm_sq_Ts += float(tensor_inner64(ts).item())
+             if name not in target_half:
+                 target_half[name] = ts.clone()
+             else:
+@@ -229,9 +228,7 @@ class OnlineLLMDiagAccumulator:
+         # Exact <A_bar, B_bar> from the two GPU fp32 half-sums, reduced in float64
+         dot_AB_exact = 0.0
+         for name in self.sum_A:
+-            a64 = self.sum_A[name].to(dtype=torch.float64)
+-            b64 = self.sum_B[name].to(dtype=torch.float64)
+-            dot_AB_exact += float(torch.sum(a64 * b64).item())
++            dot_AB_exact += float(tensor_inner64(self.sum_A[name], self.sum_B[name]).item())
+         H_exact_split = float(dot_AB_exact / (N_A * N_B))
+ 
+         # Sketch-based A_bar and B_bar (accumulated in fp32, inner product in float64)
+diff --git a/llm/l0_pipeline.py b/llm/l0_pipeline.py
+new file mode 100644
+index 0000000..09559e1
+--- /dev/null
++++ b/llm/l0_pipeline.py
+@@ -0,0 +1,329 @@
++"""Rented-4090 L0 orchestration. Every CUDA stage runs in a fresh process."""
++
++from __future__ import annotations
++
++import copy
++import csv
++import json
++import math
++import os
++from pathlib import Path
++import shutil
++import signal
++import subprocess
++import sys
++import time
++import traceback
++
++import yaml
++
++from llm.runtime import output_directory, checkpoint_directory, check_storage
++
++
++class StageFailure(RuntimeError):
++    def __init__(self, label, payload):
++        self.payload = payload
++        super().__init__(f"{label}: {payload.get('error_type', 'failure')}: {payload.get('message', '')}")
++
++
++def _stop_own_child(process):
++    if os.name == "posix":
++        os.killpg(process.pid, signal.SIGTERM)
++    else:
++        process.terminate()
++    try:
++        process.wait(timeout=10)
++    except subprocess.TimeoutExpired:
++        if os.name == "posix":
++            os.killpg(process.pid, signal.SIGKILL)
++        else:
++            process.kill()
++        process.wait(timeout=10)
++
++
++def run_stage(kind: str, label: str, config: dict, out: Path, timeout: float | None = None) -> dict:
++    check_storage()
++    stage = out / "stages"
++    stage.mkdir(parents=True, exist_ok=True)
++    request, response = stage / f"{label}.config.json", stage / f"{label}.result.json"
++    request.write_text(json.dumps(config, indent=2), encoding="utf-8")
++    command = [sys.executable, "-u", "-m", "llm.l0_worker", kind, str(request.resolve()), str(response.resolve())]
++    start = time.monotonic()
++    with (stage / f"{label}.out").open("w", encoding="utf-8") as log:
++        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=os.name == "posix")
++        try:
++            while process.poll() is None:
++                check_storage()
++                if timeout is not None and time.monotonic() - start > timeout:
++                    raise TimeoutError(f"{label} exceeded {timeout} seconds")
++                time.sleep(1)
++        except BaseException:
++            if process.poll() is None:
++                _stop_own_child(process)
++            raise
++    payload = json.loads(response.read_text(encoding="utf-8")) if response.exists() else {
++        "status": "failed", "error_type": "WorkerExit", "message": f"exit={process.returncode}; see {label}.out",
++    }
++    payload["elapsed_seconds"] = time.monotonic() - start
++    payload["worker_exit_code"] = process.returncode
++    response.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    if process.returncode or payload.get("status") != "complete":
++        raise StageFailure(label, payload)
++    print(f"[L0] {label} completed; physical peak={payload.get('physical_peak_gib')} GiB", flush=True)
++    return payload
++
++
++def sync_failure_result(error: Exception, backend: str) -> dict:
++    """Keep measured sync errors even if the worker exits during CUDA cleanup."""
++    payload = error.payload if isinstance(error, StageFailure) else {}
++    result = copy.deepcopy(payload.get("result", {}))
++    result.update(passed=False, backend=backend, error=str(error))
++    result["worker_exit_code"] = payload.get("worker_exit_code")
++    return result
++
++
++def read_csv(path: Path) -> list[dict]:
++    with path.open(encoding="utf-8", newline="") as stream:
++        return list(csv.DictReader(stream))
++
++
++def training_checks(rows: list[dict], k: int, max_gib: float, expected_steps: int) -> list[dict]:
++    def check(name, target, value, passed):
++        return {"check": name, "target": target, "value": value, "passed": bool(passed)}
++
++    finite = all(math.isfinite(float(row[key])) for row in rows for key in ("loss", "grad_norm"))
++    torch_peak = max((float(row["peak_vram_gb"]) for row in rows), default=float("nan"))
++    physical = [float(row["nvidia_smi_peak_gb"]) for row in rows if row.get("nvidia_smi_peak_gb") not in (None, "")]
++    physical_peak = max(physical, default=float("nan"))
++    duplicate = max((float(row["dup_group_frac"]) for row in rows), default=float("nan"))
++    checks = [check(f"k{k}:steps", expected_steps, len(rows), len(rows) == expected_steps),
++              check(f"k{k}:finite_loss_and_grad", "all finite", finite, finite),
++              check(f"k{k}:torch_peak_gib", f"< {max_gib}", torch_peak, torch_peak < max_gib),
++              check(f"k{k}:physical_peak_gib_sampled", f"< {max_gib}", physical_peak, physical_peak < max_gib),
++              check(f"k{k}:dup_group_frac", "< 0.05", duplicate, duplicate < 0.05)]
++    if k == 0:
++        values = [float(row["mean_w"]) for row in rows]
++        checks.append(check("k0:mean_w", "exactly 1", values, all(value == 1.0 for value in values)))
++    else:
++        values = [float(row["trunc_rate"]) for row in rows if int(row["step"]) >= k]
++        checks.append(check(f"k{k}:trunc_rate_after_warmup", "> 0 at every step >= k", values,
++                            bool(values) and all(value > 0 for value in values)))
++    return checks
++
++
++def recommend_budget(snr: float, h: float) -> dict:
++    detected = math.isfinite(h) and h > 0
++    total = 64 if math.isfinite(snr) and snr >= 0.05 else 128 if math.isfinite(snr) and snr >= 0.01 else 256
++    if not detected:
++        total = 256
++    return {"SNR_hat": snr, "H": h, "signal_detected": detected, "recommended_K": total,
++            "note": "Signal unresolved at this sample size; L2 cost may increase substantially." if not detected else
++                    "Low SNR; L2 cost increases substantially." if total == 256 else "CODEX_L0_4090.md SNR tier."}
++
++
++def _estimates(summary: dict, out: Path) -> dict:
++    logs = {k: read_csv(out / f"train_log_k{k}.csv") for k in (0, 2)}
++    seconds = {k: sum(sum(float(row[f"step_time_{part}"]) for part in ("gen", "train", "sync")) for row in rows) / len(rows)
++               for k, rows in logs.items()}
++    diag = read_csv(out / "diag_summary.csv")
++    diag_batch = sum(float(row["diag_time_sec"]) / (int(row["S"]) * int(row["R"])) for row in diag) / len(diag)
++    budget = summary["step4_mini_l2"]["k_recommendation"]["recommended_K"]
++    hours = {"L1": 8 * 150 * seconds[0] / 3600,
++             "L2": 3 * budget * diag_batch / 3600,
++             "L3": (5 * 150 * seconds[2] + 5 * 2 * 32 * diag_batch) / 3600,
++             "L4_core": 16 * 150 * seconds[2] / 3600}
++    price = float(summary["config"].get("gpu_price_yuan_per_hour", 2.68))
++    return {"mean_train_step_seconds": {str(k): value for k, value in seconds.items()},
++            "mean_diag_batch_seconds": diag_batch, "gpu_hours": hours,
++            "gpu_price_yuan_per_hour": price, "cost_yuan": {key: value * price for key, value in hours.items()},
++            "note": "Estimates only, based on the measured baseline runs. No L1-L4 jobs were started."}
++
++
++def run_l0_pipeline(config_path: str, backend_override: str | None = None) -> dict:
++    config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
++    out = output_directory(config, "results/e5/l0").resolve()
++    out.mkdir(parents=True, exist_ok=True)
++    # Refuse to overwrite scientific outputs from an earlier run.
++    if (out / "l0_summary.json").exists():
++        raise FileExistsError(f"L0 outputs already exist: {out}; choose a new STALEMOM_OUT")
++    config["rollout_backend"] = backend_override or config.get("rollout_backend", "vllm")
++    checkpoint_root = checkpoint_directory(config, out).resolve()
++    summary = {"status": "running", "checks": [], "attempts": [], "config": copy.deepcopy(config),
++               "output_dir": str(out), "checkpoint_root": str(checkpoint_root), "step_status": {str(i): "not_run" for i in range(1, 6)}}
++
++    def persist():
++        (out / "l0_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
++
++    def attempt(kind, label, cfg, timeout=None):
++        record = {"stage": kind, "label": label, "micro_batch_size": cfg.get("micro_batch_size"),
++                  "vllm": cfg.get("vllm", {}), "backend": cfg["rollout_backend"],
++                  "hf_batch_prompts": cfg.get("rollout", {}).get("hf_batch_prompts", 1) if cfg["rollout_backend"] == "hf" else None,
++                  "status": "running"}
++        summary["attempts"].append(record)
++        persist()
++        try:
++            payload = run_stage(kind, label, cfg, out, timeout)
++            record.update(status="complete", physical_peak_gib=payload.get("physical_peak_gib"), elapsed_seconds=payload["elapsed_seconds"])
++            return payload["result"]
++        except StageFailure as error:
++            record.update(status="failed", error=error.payload)
++            raise
++        finally:
++            persist()
++
++    try:
++        summary["step_status"]["1"] = "running"
++        setup_file = Path(os.environ.get("WORK", ".")) / "setup" / "environment_setup.json"
++        if setup_file.exists():
++            summary["environment_setup"] = json.loads(setup_file.read_text(encoding="utf-8"))
++        summary["storage_before"] = check_storage()
++        env_free = float(config.get("environment_min_free_gib", 70))
++        if summary["storage_before"] and summary["storage_before"]["data_free_gib"] < env_free:
++            raise RuntimeError(f"Environment acceptance failed: need >= {env_free} GiB free before L0")
++        summary["df_before"] = subprocess.run(["df", "-h"], capture_output=True, text=True).stdout if os.name == "posix" else "Windows development environment"
++        summary["step1_env"] = attempt("env", "environment", {**config, "output_dir": str(out), "_paths_resolved": True})
++        summary["step_status"]["1"] = "passed"
++        summary["step_status"]["2"] = "running"
++        sync_deadline = time.monotonic() + 1800
++        try:
++            sync = attempt("sync", "sync_auto", config, max(1, sync_deadline - time.monotonic()))
++            if not sync["passed"]:
++                raise StageFailure("sync_auto", {"error_type": "LogprobMismatch", "message": str(sync), "result": sync})
++        except (StageFailure, TimeoutError) as error:
++            summary["initial_sync_error"] = str(error)
++            retry = copy.deepcopy(config)
++            retry.setdefault("vllm", {})["sync_method"] = "apply_model"
++            try:
++                if time.monotonic() >= sync_deadline:
++                    raise TimeoutError("Weight-sync problem reached the 30-minute budget")
++                sync = attempt("sync", "sync_public_api", retry, sync_deadline - time.monotonic())
++                if sync.get("passed"):
++                    config.setdefault("vllm", {})["sync_method"] = "apply_model"
++            except (StageFailure, TimeoutError) as second:
++                sync = sync_failure_result(second, config["rollout_backend"])
++        (out / "weight_sync_check.json").write_text(json.dumps(sync, indent=2), encoding="utf-8")
++        summary["step2_weight_sync"] = sync
++        summary["checks"].append({"check": "vllm_weight_sync" if config["rollout_backend"] == "vllm" else "hf_weight_consistency",
++                                  "target": "mean absolute logprob difference < 0.02",
++                                  "value": sync.get("logprob_mean_diff"), "passed": bool(sync.get("passed"))})
++        if not sync.get("passed"):
++            if config["rollout_backend"] != "vllm":
++                raise RuntimeError("HF weight consistency test failed")
++            config["rollout_backend"] = "hf"
++            summary["step_status"]["2"] = "vllm_failed_hf_fallback"
++        else:
++            summary["step_status"]["2"] = "passed"
++        summary["backend_for_steps_3_4"] = config["rollout_backend"]
++        summary["step_status"]["3"] = "running"
++        smoke = config.get("smoke_checks", {})
++        steps = int(smoke.get("steps", 10))
++        summary["step3_runs"] = {}
++        final_training_config = copy.deepcopy(config)
++        for k in (0, 2):
++            run = copy.deepcopy(final_training_config)
++            run.update(k=k, c=float("inf") if k == 0 else 1.2, steps=steps, optimizer="sgd_mom", lr=0.01,
++                       momentum=0.9, eval_every=0, save_checkpoints_at=[0, steps - 1], _paths_resolved=True)
++            result = None
++            for index in range(3):
++                folder = f"train_k{k}_attempt{index}"
++                run.update(output_dir=str(out / folder), _checkpoint_output_dir=str(checkpoint_root / folder))
++                try:
++                    result = attempt("train", folder, run)
++                    break
++                except StageFailure as error:
++                    is_oom = error.payload.get("error_type") in ("OutOfMemoryError", "CUDAOutOfMemoryError") or "cuda out of memory" in error.payload.get("message", "").lower()
++                    if not is_oom or index == 2:
++                        raise
++                    if index == 0:
++                        run["micro_batch_size"] = 2
++                    else:
++                        run.setdefault("vllm", {})["gpu_memory_utilization"] = float(smoke.get("oom_gpu_memory_utilization", 0.15))
++            assert result is not None
++            shutil.copy2(Path(result["output_dir"]) / "train_log.csv", out / f"train_log_k{k}.csv")
++            rows = read_csv(out / f"train_log_k{k}.csv")
++            checks = training_checks(rows, k, float(smoke.get("max_vram_gb", 22)), steps)
++            summary["checks"].extend(checks)
++            summary["step3_runs"][f"k={k}"] = result
++            summary["step3_runs"][f"k={k}"]["all_advantages_zero"] = all(float(row["zero_adv_frac"]) == 1 for row in rows)
++            if not all(check["passed"] for check in checks):
++                raise RuntimeError(f"k={k} training acceptance checks failed; see l0_summary.json")
++            final_training_config["micro_batch_size"] = run.get("micro_batch_size", 4)
++            final_training_config["vllm"] = copy.deepcopy(run.get("vllm", {}))
++        summary["final_training_config"] = final_training_config
++        baseline_rows = {k: read_csv(out / f"train_log_k{k}.csv") for k in (0, 2)}
++        baseline_peak = max(float(row[key]) for rows in baseline_rows.values() for row in rows
++                            for key in ("peak_vram_gb", "nvidia_smi_peak_gb"))
++        if smoke.get("throughput_probe", False) and final_training_config.get("micro_batch_size", 4) == 4 and baseline_peak < 25:
++            probe = copy.deepcopy(final_training_config)
++            probe.update(k=0, c=float("inf"), steps=3, optimizer="sgd_mom", lr=0.01, momentum=0.9,
++                         micro_batch_size=8, eval_every=0, save_checkpoints_at=[], _paths_resolved=True,
++                         output_dir=str(out / "throughput_mb8"), _checkpoint_output_dir=str(checkpoint_root / "throughput_mb8"))
++            result = attempt("train", "throughput_mb8", probe)
++            shutil.copy2(Path(result["output_dir"]) / "train_log.csv", out / "train_log_mb8.csv")
++            rows = read_csv(out / "train_log_mb8.csv")
++            if len(rows) != 3 or not all(math.isfinite(float(row[key])) for row in rows for key in ("loss", "grad_norm")):
++                raise RuntimeError("micro_batch_size=8 throughput probe failed")
++            training_seconds = sum(float(row["step_time_train"]) for row in rows) / len(rows)
++            baseline_seconds = sum(float(row["step_time_train"]) for row in baseline_rows[0]) / len(baseline_rows[0])
++            summary["throughput_probe"] = {"micro_batch_size": 8, "steps": len(rows),
++                                           "mean_training_seconds": training_seconds,
++                                           "baseline_k0_mean_training_seconds": baseline_seconds,
++                                           "training_speedup": baseline_seconds / training_seconds if training_seconds > 0 else None,
++                                           "torch_peak_gib": max(float(row["peak_vram_gb"]) for row in rows),
++                                           "physical_peak_gib_sampled": max(float(row["nvidia_smi_peak_gb"]) for row in rows),
++                                           "adopted_for_later_stages": False}
++        else:
++            summary["throughput_probe"] = {"status": "not_run", "baseline_peak_gib": baseline_peak,
++                                           "reason": "Requires enabled probe, baseline micro-batch 4 and peak below 25 GiB."}
++        summary["step_status"]["3"] = "passed"
++        summary["step_status"]["4"] = "running"
++        mini = smoke.get("mini_l2", {})
++        diag_rows = []
++        for step in (0, steps - 1):
++            diag = copy.deepcopy(final_training_config)
++            diag.update(k=0, c=float("inf"), _paths_resolved=True,
++                        output_dir=str(out / f"diag_step{step}"),
++                        checkpoint_paths=[summary["step3_runs"]["k=0"]["checkpoints"][str(step)]],
++                        delete_checkpoint_after_diag=False)
++            rollout = config.get("rollout", {})
++            diag["nested_design"] = {"S": mini.get("S", 4), "R": mini.get("R", 2),
++                                     **{key: rollout.get(key, default) for key, default in (
++                                         ("group_size", 4), ("temperature", 1.0), ("top_p", 1.0), ("max_new_tokens", 512))},
++                                     "prompts_per_set": rollout.get("prompts_per_step", 32)}
++            diag["sketch"] = {"D": mini.get("sketch_dim", 2**22)}
++            result = attempt("diag", f"diag_step{step}", diag)
++            row = result["diag_rows"][0]
++            row["H"] = row["H_hat"]
++            row["signal_detected"] = math.isfinite(row["H_hat"]) and row["H_hat"] > 0
++            diag_rows.append(row)
++            summary["step4_mini_l2"] = {"rows": list(diag_rows)}
++            with (out / "diag_summary.csv").open("w", newline="", encoding="utf-8") as stream:
++                writer = csv.DictWriter(stream, fieldnames=list(row))
++                writer.writeheader(); writer.writerows(diag_rows)
++            error = float(row["sketch_rel_err"])
++            passed = math.isfinite(error) and error < 0.05
++            summary["checks"].append({"check": f"diag_step{step}:sketch_rel_err", "target": "< 0.05", "value": error, "passed": passed})
++            if not passed:
++                raise RuntimeError(f"Diagnostic sketch check failed at step {step}")
++        last = diag_rows[-1]
++        summary["step4_mini_l2"] = {"rows": diag_rows, "k_recommendation": recommend_budget(last["SNR_hat"], last["H_hat"])}
++        summary["step_status"]["4"] = "passed"
++        summary["step_status"]["5"] = "running"
++        summary["step5_estimates"] = _estimates(summary, out)
++        summary["step_status"]["5"] = "passed"
++        summary["status"] = "complete" if sync.get("passed") else "complete_with_hf_fallback"
++    except BaseException as error:
++        for step, status in summary["step_status"].items():
++            if status == "running":
++                summary["step_status"][step] = "failed"
++        summary.update(status="stopped", error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())
++        raise
++    finally:
++        try:
++            summary["storage_after"] = check_storage()
++        except Exception as storage_error:
++            summary["storage_after"] = {"safety_stop": str(storage_error)}
++        persist()
++        from llm.l0_report import generate_report
++        generate_report(out)
++    return summary
+diff --git a/llm/l0_report.py b/llm/l0_report.py
+new file mode 100644
+index 0000000..f10dab6
+--- /dev/null
++++ b/llm/l0_report.py
+@@ -0,0 +1,87 @@
++"""Generate the L0 report exclusively from the saved JSON and CSV artifacts."""
++
++from __future__ import annotations
++
++import csv
++import json
++import math
++from pathlib import Path
++
++
++def _csv(path):
++    if not path.exists():
++        return []
++    with path.open(encoding="utf-8", newline="") as stream:
++        return list(csv.DictReader(stream))
++
++
++def _write(path, rows):
++    if rows:
++        with path.open("w", encoding="utf-8", newline="") as stream:
++            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
++            writer.writeheader(); writer.writerows(rows)
++
++
++def _table(rows, columns):
++    if not rows:
++        return "未运行或未产出数据。\n"
++    def text(value):
++        if isinstance(value, float):
++            return f"{value:.6g}" if math.isfinite(value) else str(value)
++        return str(value).replace("|", "\\|").replace("\n", " ")
++    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
++    lines.extend("| " + " | ".join(text(row.get(column, "")) for column in columns) + " |" for row in rows)
++    return "\n".join(lines) + "\n"
++
++
++def generate_report(out: Path):
++    summary = json.loads((out / "l0_summary.json").read_text(encoding="utf-8"))
++    metrics = []
++    for k in (0, 2):
++        rows = _csv(out / f"train_log_k{k}.csv")
++        if not rows:
++            continue
++        def mean(key):
++            return sum(float(row[key]) for row in rows) / len(rows)
++        physical = [float(row["nvidia_smi_peak_gb"]) for row in rows if row.get("nvidia_smi_peak_gb") not in (None, "")]
++        metrics.append({"k": k, "steps": len(rows), "torch_peak_gib": max(float(row["peak_vram_gb"]) for row in rows),
++                        "physical_peak_gib_sampled": max(physical) if physical else "unavailable",
++                        "generation_seconds": mean("step_time_gen"), "training_seconds": mean("step_time_train"),
++                        "sync_seconds": mean("step_time_sync"), "reward_mean": mean("reward_mean"),
++                        "zero_adv_frac": mean("zero_adv_frac"), "dup_group_frac": mean("dup_group_frac"),
++                        "trunc_rate": mean("trunc_rate"), "mean_w": mean("mean_w")})
++    _write(out / "l0_metrics.csv", metrics)
++    _write(out / "step_status.csv", [{"step": step, "status": status} for step, status in summary.get("step_status", {}).items()])
++    _write(out / "acceptance_checks.csv", summary.get("checks", []))
++    estimates = summary.get("step5_estimates", {})
++    costs = [{"phase": phase, "gpu_hours": hours, "cost_yuan": estimates["cost_yuan"][phase]}
++             for phase, hours in estimates.get("gpu_hours", {}).items()]
++    _write(out / "cost_estimates.csv", costs)
++    env = summary.get("step1_env", {})
++    lines = ["# L0 报告", "", f"状态：`{summary['status']}`。本报告由 `llm.l0_report` 从保存的 JSON/CSV 生成。", "",
++             "## 1. 环境与磁盘", "", "```json", json.dumps(env, ensure_ascii=False, indent=2), "```", "",
++             "环境安装记录与版本选择：", "", "```json", json.dumps(summary.get("environment_setup", {}), ensure_ascii=False, indent=2), "```", "",
++             "数据盘与空间检查：", "", "```json", json.dumps({key: summary.get(key) for key in ("storage_before", "storage_after")}, ensure_ascii=False, indent=2), "```", "",
++             "运行前 df 输出（实际挂载目录以此及 storage_before.work 为准）：", "", "```text", summary.get("df_before", "unavailable"), "```", "",
++             "## 2. 合格检查表", "", _table(_csv(out / "step_status.csv"), ["step", "status"]), "",
++             _table(_csv(out / "acceptance_checks.csv"), ["check", "target", "value", "passed"]), "",
++             "权重同步检查：", "", "```json", json.dumps(summary.get("step2_weight_sync", {"status": "not_run"}), ensure_ascii=False, indent=2), "```", "",
++             "## 3. 显存与单步用时", "", _table(_csv(out / "l0_metrics.csv"), ["k", "steps", "torch_peak_gib", "physical_peak_gib_sampled", "generation_seconds", "training_seconds", "sync_seconds"]), "",
++             "驱动显存为周期采样峰值，可能漏掉采样间瞬态；PyTorch 的睡眠池计数不能直接等同于物理占用。", "",
++             "micro-batch 测速（仅测试，后续配置由用户决定）：", "", "```json", json.dumps(summary.get("throughput_probe", {"status": "not_run"}), ensure_ascii=False, indent=2), "```", "",
++             "## 4. 训练指标", "", _table(_csv(out / "l0_metrics.csv"), ["k", "reward_mean", "zero_adv_frac", "dup_group_frac", "trunc_rate", "mean_w"]), "",
++             "## 5. 诊断", "", _table(_csv(out / "diag_summary.csv"), ["step", "SNR_hat", "H", "N_bar", "sketch_rel_err", "zero_adv_frac", "signal_detected"]), "",
++             "K 建议与信号是否可测：", "", "```json", json.dumps(summary.get("step4_mini_l2", {}).get("k_recommendation", {"status": "not_run"}), ensure_ascii=False, indent=2), "```", "",
++             "## 6. 后续用时与费用估算", "", _table(_csv(out / "cost_estimates.csv"), ["phase", "gpu_hours", "cost_yuan"]), "",
++             "估算依据：", "", "```json", json.dumps(estimates or {"status": "not_run"}, ensure_ascii=False, indent=2), "```", "",
++             "## 7. 问题与修改", "", "正式入口现在使用独立子进程隔离各阶段，统一结果和 checkpoint 路径，限制 vLLM 并发并在唤醒前释放闲置缓存；统计归约采用分块 float64。代码差异见 code_changes.diff。", "",
++             "HF 回退支持带左填充的 prompt 分批生成，具体批量数记录在 config.rollout.hf_batch_prompts 与各次尝试中。同步子进程退出异常时仍保留已经写出的误差和接口信息。", "",
++             "全部尝试及参数（失败尝试保留）：", "", "```json", json.dumps(summary.get("attempts", []), ensure_ascii=False, indent=2), "```", ""]
++    if summary.get("error"):
++        lines += ["停止原因：", "", "```text", summary["error"], "```", ""]
++    for run in summary.get("step3_runs", {}).values():
++        if run.get("all_advantages_zero"):
++            lines += ["警告：至少一个训练 run 的全部 batch 优势均为零；资源链路通过不代表发生了有效学习。", ""]
++            break
++    lines += ["L0 后停止，未运行后续实验，也未关机或修改计费。", ""]
++    (out / "l0_report.md").write_text("\n".join(lines), encoding="utf-8")
+diff --git a/llm/l0_worker.py b/llm/l0_worker.py
+new file mode 100644
+index 0000000..34f5b50
+--- /dev/null
++++ b/llm/l0_worker.py
+@@ -0,0 +1,60 @@
++"""One isolated L0 stage, so a completed stage releases its CUDA context."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++import traceback
++
++from llm.runtime import MemorySampler, check_storage
++
++
++def execute(kind: str, config: dict) -> dict:
++    if kind == "env":
++        from llm.run_l0 import step1_record_environment
++        return step1_record_environment(Path(config["output_dir"]))
++    if kind == "sync":
++        import torch
++        from llm.run_l0 import step2_test_weight_sync
++
++        return step2_test_weight_sync(
++            model_name=config["model"], backend_name=config["rollout_backend"],
++            device=torch.device(config.get("device", "cuda")),
++            vllm_cfg=config.get("vllm", {}), seed=config.get("data", {}).get("seed", 42),
++            dataset_name=config.get("data", {}).get("dataset", "openai/gsm8k"),
++            max_new_tokens=64,
++        )
++    if kind == "train":
++        from llm.train import main
++        return main(config)
++    if kind == "diag":
++        from llm.run_diag import run_checkpoint_diagnostics
++        return run_checkpoint_diagnostics(config)
++    raise ValueError(kind)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("kind", choices=["env", "sync", "train", "diag"])
++    parser.add_argument("config")
++    parser.add_argument("result")
++    args = parser.parse_args()
++    target = Path(args.result)
++    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
++    sampler = None
++    try:
++        check_storage()
++        with MemorySampler(target.with_suffix(".memory.jsonl")) as sampler:
++            result = execute(args.kind, config)
++        payload = {"status": "complete", "result": result, "physical_peak_gib": sampler.peak}
++        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    except Exception as exc:
++        payload = {"status": "failed", "error_type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc(), "physical_peak_gib": sampler.peak if sampler else None}
++        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++        traceback.print_exc()
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/llm/run_diag.py b/llm/run_diag.py
+index 7b0cc6c..0aac971 100644
+--- a/llm/run_diag.py
++++ b/llm/run_diag.py
+@@ -18,6 +18,7 @@ from llm.train import (
+     write_llm_env_file,
+ )
+ from stalemom.diag import compute_c3
++from llm.runtime import output_directory, checkpoint_directory, check_storage, physical_peak_gib
+ 
+ 
+ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
+@@ -30,7 +31,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
+     else:
+         cfg = copy.deepcopy(config)
+ 
+-    out_dir = Path(cfg.get("output_dir", cfg.get("out_dir", "results/e5/l2")))
++    out_dir = output_directory(cfg, "results/e5/l2")
+     out_dir.mkdir(parents=True, exist_ok=True)
+     write_llm_env_file(out_dir)
+ 
+@@ -85,9 +86,9 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
+     if "checkpoint_paths" in cfg:
+         ckpt_paths = [Path(p) for p in cfg["checkpoint_paths"]]
+     else:
+-        ckpt_dir = Path(cfg.get("checkpoint_dir", out_dir / "checkpoints"))
++        ckpt_dir = Path(cfg.get("checkpoint_dir", checkpoint_directory(cfg, out_dir)))
+         if not ckpt_dir.exists():
+-            ckpt_dir = Path(cfg.get("checkpoint_dir", out_dir.parent / "l1" / "checkpoints"))
++            ckpt_dir = Path(cfg.get("checkpoint_dir", checkpoint_directory({}, out_dir.parent / "l1")))
+         target_steps = cfg.get("checkpoints", cfg.get("save_checkpoints_at", [0, 50, 100]))
+         for st in target_steps:
+             candidate = ckpt_dir / f"ckpt_step_{int(st):04d}.pt"
+@@ -118,6 +119,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
+         vllm_cfg=cfg.get("vllm", {}),
+         use_bf16=use_bf16,
+         seed=seed,
++        hf_batch_prompts=int(nested_cfg.get("hf_batch_prompts", cfg.get("rollout", {}).get("hf_batch_prompts", 1))),
+     )
+ 
+     rng = np.random.default_rng(seed + 1000)
+@@ -132,6 +134,9 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
+     log_file = out_dir / "run_log.txt"
+ 
+     for ckpt_path in ckpt_paths:
++        check_storage()
++        if device.type == "cuda":
++            torch.cuda.reset_peak_memory_stats()
+         t0 = time.perf_counter()
+         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+         step = int(payload["step"])
+@@ -180,6 +185,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
+             acc.begin_set(s_idx)
+             set_items = prompt_sets[s_idx]
+             for r_idx in range(R):
++                check_storage()
+                 rollout_seed = seed + step * 10000 + s_idx * 100 + r_idx
+                 rollout_engine.wake_up()
+                 rb = rollout_engine.generate_group_rollouts(
+@@ -281,6 +287,8 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
+             "C2_hat": res["C2_hat"],
+             "C2_hat_jk_se": res["C2_hat_jk_se"],
+             "diag_time_sec": diag_time,
++            "peak_vram_gb": float(torch.cuda.max_memory_allocated(device) / 2**30) if device.type == "cuda" else 0.0,
++            "nvidia_smi_peak_gb": physical_peak_gib(),
+         }
+         diag_rows.append(row)
+ 
+diff --git a/llm/run_l0.py b/llm/run_l0.py
+index 83fb5ab..7cf3af5 100644
+--- a/llm/run_l0.py
++++ b/llm/run_l0.py
+@@ -11,22 +11,21 @@ Executes the 5-step L0 protocol in strict order, stopping immediately and report
+ from __future__ import annotations
+ 
+ import argparse
+-import copy
+ import json
+ import math
++import shutil
++import subprocess
++import sys
+ from pathlib import Path
+ import time
+ from typing import Any
+ 
+ import numpy as np
+ import torch
+-import yaml
+ 
+ from llm.data import load_gsm8k_pools
+-from llm.run_diag import run_checkpoint_diagnostics
+ from llm.train import (
+     RolloutBackend,
+-    main as train_main,
+     write_llm_env_file,
+ )
+ 
+@@ -78,11 +77,12 @@ def step1_record_environment(out_dir: Path) -> dict[str, str]:
+     except Exception as e:
+         vllm_ver = f"not_installed ({e})"
+ 
+-    cuda_ver = str(torch.version.cuda) if torch.cuda.is_available() else "cpu"
+-    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
++    cuda_available = torch.cuda.is_available() and torch.cuda.device_count() > 0
++    cuda_ver = str(torch.version.cuda) if cuda_available else "cpu"
++    gpu_name = torch.cuda.get_device_name(0) if cuda_available else "none"
+     vram_total_gb = (
+         float(torch.cuda.get_device_properties(0).total_memory / (1024.0**3))
+-        if torch.cuda.is_available()
++        if cuda_available
+         else 0.0
+     )
+ 
+@@ -93,6 +93,8 @@ def step1_record_environment(out_dir: Path) -> dict[str, str]:
+         "cuda": cuda_ver,
+         "gpu_name": gpu_name,
+         "vram_total_gb": f"{vram_total_gb:.2f}",
++        "driver": subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], capture_output=True, text=True).stdout.strip() if shutil.which("nvidia-smi") else "unavailable",
++        "git_commit": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip() if shutil.which("git") else "unavailable",
+     }
+     pin_lines = [f"{k}=={v}" for k, v in pinned.items()]
+     (out_dir / "pinned_versions.txt").write_text("\n".join(pin_lines) + "\n", encoding="utf-8")
+@@ -169,6 +171,7 @@ def step2_test_weight_sync(
+     rollout_engine.sleep(level=1)
+ 
+     max_diff, mean_diff = rollout_engine.verify_logprob_sync(hf_model, batch)
++    interface = rollout_engine.sync_interface
+     del rollout_engine, hf_model
+     if torch.cuda.is_available():
+         torch.cuda.empty_cache()
+@@ -176,6 +179,7 @@ def step2_test_weight_sync(
+     passed = bool(np.isfinite(mean_diff) and mean_diff < tol_mean_diff)
+     return {
+         "backend": backend_name,
++        "sync_interface": interface,
+         "sync_time_sec": float(sync_sec),
+         "logprob_max_diff": float(max_diff),
+         "logprob_mean_diff": float(mean_diff),
+@@ -221,133 +225,9 @@ def estimate_l1_to_l4_gpu_hours(
+ 
+ 
+ def run_l0_pipeline(config_path: str = "llm/configs/l0/smoke.yaml", backend_override: str | None = None) -> dict[str, Any]:
+-    with open(config_path, "r", encoding="utf-8") as f:
+-        base_cfg = yaml.safe_load(f)
+-
+-    out_dir = Path(base_cfg.get("output_dir", "results/e5/l0"))
+-    out_dir.mkdir(parents=True, exist_ok=True)
+-    device = torch.device(base_cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+-    use_bf16 = bool(base_cfg.get("compute_dtype", "bf16") == "bf16" and device.type == "cuda")
+-    seed = int(base_cfg.get("data", {}).get("seed", base_cfg.get("seed", 42)))
+-    dataset_name = base_cfg.get("data", {}).get("dataset", base_cfg.get("dataset", "openai/gsm8k"))
+-    max_new_tokens = int(base_cfg.get("rollout", {}).get("max_new_tokens", 512))
+-    backend_name = backend_override or base_cfg.get("rollout_backend", "vllm")
+-
+-    # Step 1: Record environment and pin versions
+-    pinned_env = step1_record_environment(out_dir)
+-
+-    # Step 2: Standalone weight synchronization test under random weight perturbation
+-    sync_res = step2_test_weight_sync(
+-        model_name=base_cfg["model"],
+-        backend_name=backend_name,
+-        device=device,
+-        vllm_cfg=base_cfg.get("vllm", {}),
+-        use_bf16=use_bf16,
+-        seed=seed,
+-        dataset_name=dataset_name,
+-        max_new_tokens=min(max_new_tokens, 64),
+-        tol_mean_diff=0.02,
+-    )
+-    if not sync_res["passed"]:
+-        raise RuntimeError(
+-            f"[L0 Step 2 FAILED] Weight sync logprob mean diff = {sync_res['logprob_mean_diff']:.6f} >= 0.02. Stopping."
+-        )
+-
+-    # Step 3: Run 10 steps of SGD+mom for k in {0, 2}
+-    smoke_cfg = base_cfg.get("smoke_checks", {})
+-    k_values = smoke_cfg.get("k_values", [0, 2])
+-    steps = int(smoke_cfg.get("steps", 10))
+-    max_vram_limit = float(smoke_cfg.get("max_vram_gb", 22.0))
+-    step3_runs = {}
+-
+-    for k_val in k_values:
+-        run_cfg = copy.deepcopy(base_cfg)
+-        run_cfg["rollout_backend"] = backend_name
+-        run_cfg["k"] = int(k_val)
+-        run_cfg["c"] = float("inf") if int(k_val) == 0 else float(smoke_cfg.get("c", 1.2))
+-        run_cfg["steps"] = steps
+-        run_cfg["optimizer"] = smoke_cfg.get("optimizer", "sgd_mom")
+-        run_cfg["momentum"] = float(smoke_cfg.get("momentum", 0.9))
+-        run_cfg["lr"] = float(smoke_cfg.get("lr", 0.01))
+-        run_cfg["micro_batch_size"] = int(base_cfg.get("micro_batch_size", 4))
+-        run_cfg["save_checkpoints_at"] = [0, steps - 1]
+-        run_cfg["eval_every"] = 0
+-        run_cfg["output_dir"] = str(out_dir / f"train_k{k_val}")
+-
+-        res_k = train_main(run_cfg)
+-        summary_k = res_k["summary"]
+-        step3_runs[f"k={k_val}"] = summary_k
+-
+-        if summary_k["diverged"]:
+-            raise RuntimeError(f"[L0 Step 3 FAILED] Training diverged at k={k_val}. Stopping.")
+-        if summary_k["peak_vram_gb"] > max_vram_limit:
+-            raise RuntimeError(
+-                f"[L0 Step 3 FAILED] Peak VRAM {summary_k['peak_vram_gb']:.2f} GB > {max_vram_limit} GB at k={k_val}. Stopping."
+-            )
+-
+-    # Step 4: Run mini-L2 (S=4, R=2) on k=0 final checkpoint
+-    mini_l2_cfg = smoke_cfg.get("mini_l2", {})
+-    diag_cfg = copy.deepcopy(base_cfg)
+-    diag_cfg["rollout_backend"] = backend_name
+-    diag_cfg["k"] = 0
+-    diag_cfg["c"] = float("inf")
+-    diag_cfg["micro_batch_size"] = int(base_cfg.get("micro_batch_size", 4))
+-    diag_cfg["checkpoint_dir"] = str(out_dir / "train_k0" / "checkpoints")
+-    diag_cfg["checkpoints"] = [steps - 1]
+-    diag_cfg["nested_design"] = {
+-        "S": int(mini_l2_cfg.get("S", 4)),
+-        "R": int(mini_l2_cfg.get("R", 2)),
+-        "prompts_per_set": int(base_cfg.get("rollout", {}).get("prompts_per_step", 32)),
+-        "group_size": int(base_cfg.get("rollout", {}).get("group_size", 4)),
+-        "temperature": float(base_cfg.get("rollout", {}).get("temperature", 1.0)),
+-        "top_p": float(base_cfg.get("rollout", {}).get("top_p", 1.0)),
+-        "max_new_tokens": max_new_tokens,
+-    }
+-    diag_cfg["sketch"] = {
+-        "D": int(mini_l2_cfg.get("sketch_dim", 4194304)),
+-    }
+-    diag_cfg["output_dir"] = str(out_dir / "mini_l2")
+-
+-    diag_res = run_checkpoint_diagnostics(diag_cfg)
+-    diag_row = diag_res["diag_rows"][-1]
+-    max_sketch_err = float(mini_l2_cfg.get("max_sketch_rel_err", 0.05))
+-    if diag_row["sketch_rel_err"] >= max_sketch_err:
+-        raise RuntimeError(
+-            f"[L0 Step 4 FAILED] CountSketch rel_err = {diag_row['sketch_rel_err']:.4f} >= {max_sketch_err}. Stopping."
+-        )
+-
+-    k_rec = recommend_l2_k_from_snr(diag_row["SNR_hat"])
+-
+-    # Step 5: Estimate GPU hours for L1–L4
+-    k2_sum = step3_runs.get("k=2", step3_runs["k=0"])
+-    mean_step_sec = (
+-        k2_sum["mean_step_time_gen"]
+-        + k2_sum["mean_step_time_train"]
+-        + k2_sum["mean_step_time_sync"]
+-    )
+-    gpu_hours = estimate_l1_to_l4_gpu_hours(
+-        mean_step_sec=mean_step_sec,
+-        recommended_k_l2=k_rec["recommended_K"],
+-    )
+-
+-    full_report = {
+-        "step1_env": pinned_env,
+-        "step2_weight_sync": sync_res,
+-        "step3_runs": step3_runs,
+-        "step4_mini_l2": {
+-            "SNR_hat": diag_row["SNR_hat"],
+-            "sketch_rel_err": diag_row["sketch_rel_err"],
+-            "H_hat": diag_row["H_hat"],
+-            "N_bar": diag_row["N_bar"],
+-            "C1": diag_row["C1"],
+-            "C1_pred": diag_row["C1_pred"],
+-            "C2_hat": diag_row["C2_hat"],
+-            "k_recommendation": k_rec,
+-        },
+-        "step5_gpu_hour_estimates": gpu_hours,
+-    }
+-    (out_dir / "l0_summary.json").write_text(json.dumps(full_report, indent=2), encoding="utf-8")
+-    return full_report
++    """Run only L0, isolating CUDA stages and preserving failures for review."""
++    from llm.l0_pipeline import run_l0_pipeline as execute
++    return execute(config_path, backend_override)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/llm/runtime.py b/llm/runtime.py
+new file mode 100644
+index 0000000..c7538f7
+--- /dev/null
++++ b/llm/runtime.py
+@@ -0,0 +1,127 @@
++"""Storage paths, bounded reductions and telemetry shared by LLM entry points."""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import threading
++import time
++
++
++def output_directory(config: dict, default: str) -> Path:
++    raw = Path(config.get("output_dir", config.get("out_dir", default)))
++    if config.get("_paths_resolved") or not os.environ.get("STALEMOM_OUT"):
++        return raw
++    if raw.is_absolute():
++        raise ValueError("Use relative output_dir with STALEMOM_OUT")
++    suffix = Path(*raw.parts[1:]) if raw.parts and raw.parts[0] == "results" else raw
++    return Path(os.environ["STALEMOM_OUT"]) / suffix
++
++
++def checkpoint_directory(config: dict, out_dir: Path) -> Path:
++    if config.get("_checkpoint_output_dir"):
++        return Path(config["_checkpoint_output_dir"])
++    root = os.environ.get("STALEMOM_CKPT")
++    if not root:
++        return out_dir / "checkpoints"
++    result_root = Path(os.environ.get("STALEMOM_OUT", "results"))
++    try:
++        suffix = out_dir.relative_to(result_root)
++    except ValueError:
++        suffix = Path(out_dir.name)
++    return Path(root) / suffix
++
++
++def check_storage() -> dict:
++    """Enforce the rented-server thresholds only when WORK is configured."""
++    work = os.environ.get("WORK")
++    if not work:
++        return {}
++    data = shutil.disk_usage(work).free / 2**30
++    system = shutil.disk_usage(Path(work).anchor if os.name == "nt" else "/").free / 2**30
++    minimum = float(os.environ.get("STALEMOM_MIN_FREE_GIB", "15"))
++    if data < minimum or system < minimum:
++        raise RuntimeError(f"Storage safety stop: data free={data:.3f} GiB, system free={system:.3f} GiB")
++    return {"work": work, "data_free_gib": data, "system_free_gib": system, "minimum_free_gib": minimum}
++
++
++def tensor_inner64(left, right=None, chunk_elements: int = 2**20):
++    """A float64 reduction with bounded scratch space, including large embeddings."""
++    import torch
++
++    a = left.detach().reshape(-1)
++    b = a if right is None else right.detach().reshape(-1)
++    if a.numel() != b.numel():
++        raise ValueError("Inner product shape mismatch")
++    total = torch.zeros((), dtype=torch.float64, device=a.device)
++    for start in range(0, a.numel(), chunk_elements):
++        x = a[start : start + chunk_elements].to(dtype=torch.float64)
++        y = x if right is None else b[start : start + chunk_elements].to(device=a.device, dtype=torch.float64)
++        total.add_(torch.sum(x * y))
++    return total
++
++
++def process_gpu_gib(pid: int | None = None) -> float | None:
++    """Physical process memory; separate from PyTorch's sleeping-pool counters."""
++    try:
++        result = subprocess.run(
++            ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
++            capture_output=True, text=True, timeout=5, check=True,
++        )
++        wanted = os.getpid() if pid is None else pid
++        values = []
++        for line in result.stdout.splitlines():
++            fields = [part.strip() for part in line.split(",")]
++            if len(fields) == 2 and fields[0] == str(wanted):
++                values.append(float(fields[1]) / 1024)
++        return sum(values)
++    except (OSError, ValueError, subprocess.SubprocessError):
++        return None
++
++
++_sampler = None
++
++
++class MemorySampler:
++    def __init__(self, log_path: Path, interval: float = 0.25):
++        self.path = log_path
++        self.interval = interval
++        self.peak = None
++        self.stop = threading.Event()
++        self.thread = threading.Thread(target=self._sample, daemon=True)
++
++    def _sample(self):
++        import json
++
++        with self.path.open("a", encoding="utf-8") as stream:
++            while not self.stop.is_set():
++                value = process_gpu_gib()
++                if value is not None:
++                    self.peak = max(self.peak or 0.0, value)
++                    stream.write(json.dumps({"time": time.time(), "pid": os.getpid(), "gpu_gib": value}) + "\n")
++                    stream.flush()
++                self.stop.wait(self.interval)
++
++    def __enter__(self):
++        global _sampler
++        _sampler = self
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self.thread.start()
++        return self
++
++    def __exit__(self, *_):
++        global _sampler
++        self.stop.set()
++        self.thread.join(timeout=6)
++        _sampler = None
++
++
++def physical_peak_gib() -> float | None:
++    if _sampler is not None:
++        current = process_gpu_gib()
++        if current is not None:
++            _sampler.peak = max(_sampler.peak or 0.0, current)
++        return _sampler.peak
++    return process_gpu_gib()
+diff --git a/llm/train.py b/llm/train.py
+index 30fe77f..051e950 100644
+--- a/llm/train.py
++++ b/llm/train.py
+@@ -15,6 +15,8 @@ import numpy as np
+ import yaml
+ 
+ from llm.reward import compute_exact_match_reward, compute_grpo_advantages
++from llm.runtime import (output_directory, checkpoint_directory, check_storage,
++                         tensor_inner64, physical_peak_gib)
+ 
+ 
+ def compute_token_weights_numpy(
+@@ -402,13 +404,13 @@ def compute_grad_norm_and_online_c1_gpu(
+     for _, p in model.named_parameters():
+         if not p.requires_grad or p.grad is None:
+             continue
+-        g64 = p.grad.detach().to(dtype=torch.float64)
++        grad = p.grad.detach()
+         if norm_g_sq is None:
+-            dev = g64.device
++            dev = grad.device
+             dot = torch.zeros((), dtype=torch.float64, device=dev)
+             norm_m_sq = torch.zeros((), dtype=torch.float64, device=dev)
+             norm_g_sq = torch.zeros((), dtype=torch.float64, device=dev)
+-        norm_g_sq = norm_g_sq + torch.sum(g64 * g64)
++        norm_g_sq = norm_g_sq + tensor_inner64(grad)
+ 
+         state = optimizer.state.get(p, {})
+         buf = None
+@@ -418,9 +420,8 @@ def compute_grad_norm_and_online_c1_gpu(
+             buf = state.get("exp_avg", None)
+ 
+         if buf is not None:
+-            m64 = buf.detach().to(device=g64.device, dtype=torch.float64)
+-            norm_m_sq = norm_m_sq + torch.sum(m64 * m64)
+-            dot = dot + torch.sum(m64 * g64)
++            norm_m_sq = norm_m_sq + tensor_inner64(buf)
++            dot = dot + tensor_inner64(buf, grad)
+ 
+     if norm_g_sq is None:
+         return 0.0, float("nan")
+@@ -525,8 +526,7 @@ def extract_momentum_buffers(optimizer, model, opt_name: str) -> tuple[dict[str,
+         if buf is not None:
+             buf_cpu = buf.detach().to(device="cpu", dtype=torch.float32).clone()
+             m_dict[name] = buf_cpu
+-            b64 = buf.detach().to(dtype=torch.float64)
+-            norm_m_sq += float(torch.sum(b64 * b64).item())
++            norm_m_sq += float(tensor_inner64(buf).item())
+ 
+     return m_dict, sq_dict, float(np.sqrt(norm_m_sq))
+ 
+@@ -543,6 +543,7 @@ class RolloutBackend:
+         vllm_cfg: dict | None = None,
+         use_bf16: bool = True,
+         seed: int = 42,
++        hf_batch_prompts: int = 1,
+     ):
+         import torch
+         from transformers import AutoModelForCausalLM
+@@ -553,9 +554,14 @@ class RolloutBackend:
+         self.device = torch.device(device)
+         self.use_bf16 = bool(use_bf16)
+         self.seed = int(seed)
++        self.hf_batch_prompts = int(hf_batch_prompts)
++        if self.hf_batch_prompts < 1:
++            raise ValueError("hf_batch_prompts must be positive")
+         vcfg = vllm_cfg or {}
+         self.enable_sleep_mode = bool(vcfg.get("enable_sleep_mode", True))
+         self._is_sleeping = False
++        self.sync_interface = None
++        self.sync_method = vcfg.get("sync_method", "auto")
+ 
+         if self.backend == "hf":
+             dtype = torch.bfloat16 if (self.use_bf16 and self.device.type == "cuda") else torch.float32
+@@ -565,6 +571,10 @@ class RolloutBackend:
+             self.vllm_engine = None
+         elif self.backend == "vllm":
+             from vllm import LLM
++            options = {name: vcfg[name] for name in (
++                "enforce_eager", "max_model_len", "max_num_seqs",
++                "max_num_batched_tokens", "enable_chunked_prefill",
++            ) if name in vcfg}
+             self.vllm_engine = LLM(
+                 model=model_name,
+                 dtype="bfloat16",
+@@ -572,6 +582,7 @@ class RolloutBackend:
+                 gpu_memory_utilization=float(vcfg.get("gpu_memory_utilization", 0.30)),
+                 seed=int(vcfg.get("seed", self.seed)),
+                 trust_remote_code=True,
++                **options,
+             )
+             self.hf_model = None
+         else:
+@@ -588,6 +599,8 @@ class RolloutBackend:
+         """Wake up vLLM engine before weight synchronization or rollout generation."""
+         if self.backend == "vllm" and self.vllm_engine is not None and self.enable_sleep_mode:
+             if self._is_sleeping and hasattr(self.vllm_engine, "wake_up"):
++                import torch
++                torch.cuda.empty_cache()
+                 self.vllm_engine.wake_up()
+                 self._is_sleeping = False
+ 
+@@ -603,18 +616,24 @@ class RolloutBackend:
+             }
+             self.hf_model.load_state_dict(cast_sd, strict=True)
+             self.hf_model.eval()
++            self.sync_interface = "hf.load_state_dict"
+         elif self.backend == "vllm":
+             self.wake_up()
+             weights = [
+                 (k, v.to(dtype=torch.bfloat16))
+                 for k, v in fp32_state_dict.items()
+             ]
++            if self.sync_method == "apply_model":
++                self.vllm_engine.apply_model(lambda m: m.load_weights(weights))
++                self.sync_interface = "LLM.apply_model"
++                return
+             # 1. Try direct V0 driver_worker.model_runner path first
+             try:
+                 model_runner = (
+                     self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner
+                 )
+                 model_runner.model.load_weights(weights)
++                self.sync_interface = "driver_worker.model_runner.model.load_weights"
+                 return
+             except AttributeError:
+                 pass
+@@ -624,17 +643,20 @@ class RolloutBackend:
+                     self.vllm_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+                 )
+                 model_runner.model.load_weights(weights)
++                self.sync_interface = "driver_worker.worker.model_runner.model.load_weights"
+                 return
+             except AttributeError:
+                 pass
+             # 3. Fallback to public vLLM apply_model API (vLLM V1 / 0.7+)
+             if hasattr(self.vllm_engine, "apply_model"):
+                 self.vllm_engine.apply_model(lambda m: m.load_weights(weights))
++                self.sync_interface = "LLM.apply_model"
+                 return
+             if hasattr(self.vllm_engine, "llm_engine") and hasattr(self.vllm_engine.llm_engine, "model_executor"):
+                 executor = self.vllm_engine.llm_engine.model_executor
+                 if hasattr(executor, "apply_model"):
+                     executor.apply_model(lambda m: m.load_weights(weights))
++                    self.sync_interface = "model_executor.apply_model"
+                     return
+             raise RuntimeError("Unable to synchronize weights into vLLM engine via driver_worker or apply_model")
+ 
+@@ -668,12 +690,18 @@ class RolloutBackend:
+             if seed is not None:
+                 torch.manual_seed(int(seed))
+             with torch.no_grad():
+-                for item in items:
+-                    enc = self.tokenizer(item.prompt_text, return_tensors="pt", add_special_tokens=False)
+-                    p_ids = enc["input_ids"].to(self.device)
+-                    p_len = int(p_ids.shape[1])
+-                    p_ids_rep = p_ids.repeat(group_size, 1)
+-                    attn_rep = torch.ones_like(p_ids_rep)
++                for start in range(0, len(items), self.hf_batch_prompts):
++                    batch_items = items[start : start + self.hf_batch_prompts]
++                    prompts = [self.tokenizer(item.prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
++                               for item in batch_items]
++                    prompt_width = max(map(len, prompts))
++                    p_ids_rep = torch.full((len(batch_items) * group_size, prompt_width), pad_id,
++                                           dtype=torch.long, device=self.device)
++                    attn_rep = torch.zeros_like(p_ids_rep)
++                    for index, ids in enumerate(prompts):
++                        group = slice(index * group_size, (index + 1) * group_size)
++                        p_ids_rep[group, -len(ids):] = torch.tensor(ids, dtype=torch.long, device=self.device)
++                        attn_rep[group, -len(ids):] = 1
+ 
+                     gen_out = self.hf_model.generate(
+                         input_ids=p_ids_rep,
+@@ -685,16 +713,19 @@ class RolloutBackend:
+                         pad_token_id=pad_id,
+                         eos_token_id=eos_id,
+                     )
+-                    for g_idx in range(group_size):
+-                        seq = gen_out[g_idx].tolist()
++                    for row_idx in range(len(batch_items) * group_size):
++                        item_idx = row_idx // group_size
++                        item = batch_items[item_idx]
++                        p_len = len(prompts[item_idx])
++                        seq = gen_out[row_idx].tolist()
+                         # Trim trailing pad tokens after EOS
+-                        resp_part = seq[p_len:]
++                        resp_part = seq[prompt_width:]
+                         if eos_id is not None and eos_id in resp_part:
+                             first_eos = resp_part.index(eos_id)
+                             resp_part = resp_part[: first_eos + 1]
+                         if len(resp_part) == 0:
+                             resp_part = [eos_id if eos_id is not None else 0]
+-                        full_seq = seq[:p_len] + resp_part
++                        full_seq = prompts[item_idx] + resp_part
+                         text = self.tokenizer.decode(resp_part, skip_special_tokens=True)
+                         rew = compute_exact_match_reward(text, item.ground_truth)
+ 
+@@ -914,7 +945,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
+     else:
+         cfg = copy.deepcopy(config)
+ 
+-    out_dir = Path(cfg.get("output_dir", cfg.get("out_dir", "results/e5/l0")))
++    out_dir = output_directory(cfg, "results/e5/l0")
+     out_dir.mkdir(parents=True, exist_ok=True)
+     write_llm_env_file(out_dir)
+ 
+@@ -994,6 +1025,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
+         vllm_cfg=cfg.get("vllm", {}),
+         use_bf16=use_bf16,
+         seed=seed,
++        hf_batch_prompts=int(rollout_cfg.get("hf_batch_prompts", 1)),
+     )
+ 
+     optimizer = build_optimizer(
+@@ -1003,7 +1035,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
+ 
+     log_file = out_dir / "run_log.txt"
+     csv_file = out_dir / "train_log.csv"
+-    ckpt_dir = out_dir / "checkpoints"
++    ckpt_dir = checkpoint_directory(cfg, out_dir)
+ 
+     rng = np.random.default_rng(seed)
+     step_rows = []
+@@ -1029,6 +1061,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
+         "step_time_train",
+         "step_time_sync",
+         "peak_vram_gb",
++        "nvidia_smi_peak_gb",
+     ]
+ 
+     with open(csv_file, "w", newline="", encoding="utf-8") as cf:
+@@ -1036,6 +1069,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
+         writer.writeheader()
+ 
+         for step in range(steps):
++            check_storage()
+             # Push current fp32 snapshot theta_t into staleness ring buffer
+             staleness_buf.push(step, model.state_dict())
+             behav_sd = staleness_buf.get_behavior_weights(step)
+@@ -1146,6 +1180,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
+                 "step_time_train": step_time_train,
+                 "step_time_sync": step_time_sync,
+                 "peak_vram_gb": peak_vram_gb,
++                "nvidia_smi_peak_gb": physical_peak_gib(),
+             }
+             step_rows.append(row)
+             writer.writerow(row)
+diff --git a/scripts/run_l0.sh b/scripts/run_l0.sh
+new file mode 100755
+index 0000000..5d731ad
+--- /dev/null
++++ b/scripts/run_l0.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++set -euo pipefail
++set +u
++source ~/.bashrc
++set -u
++PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
++if [[ -r "$PROJECT_ROOT/../storage_env.sh" ]]; then
++  source "$PROJECT_ROOT/../storage_env.sh"
++fi
++: "${WORK:?Set WORK to the verified data-disk work directory}"
++: "${STALEMOM_OUT:?Set STALEMOM_OUT on the data disk}"
++: "${STALEMOM_CKPT:?Set STALEMOM_CKPT on the data disk}"
++source "${CONDA_BASE:-$(conda info --base)}/etc/profile.d/conda.sh"
++conda activate "$WORK/envs/stalemom"
++cd "$WORK/stalemom"
++export HF_ENDPOINT=https://hf-mirror.com
++export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
++export VLLM_ENABLE_V1_MULTIPROCESSING=0
++export CUDA_VISIBLE_DEVICES=0
++export OMP_NUM_THREADS=4
++export MKL_NUM_THREADS=4
++export MAX_JOBS=2
++export TOKENIZERS_PARALLELISM=false
++mkdir -p "$STALEMOM_OUT/e5/l0"
++python -m llm.run_l0 --config llm/configs/l0/smoke.yaml "$@" 2>&1 | tee "$STALEMOM_OUT/e5/l0/run_l0.out"
+diff --git a/tests_e5/test_l0_runtime.py b/tests_e5/test_l0_runtime.py
+new file mode 100644
+index 0000000..a55e1ef
+--- /dev/null
++++ b/tests_e5/test_l0_runtime.py
+@@ -0,0 +1,260 @@
++"""Regression coverage for the rented-GPU L0 execution and resource boundaries."""
++
++import csv
++import json
++import math
++from pathlib import Path
++import types
++
++import numpy as np
++import pytest
++import torch
++import yaml
++
++from llm.runtime import output_directory, checkpoint_directory, check_storage, tensor_inner64
++from llm.l0_pipeline import training_checks, recommend_budget, StageFailure
++
++
++@pytest.fixture(autouse=True)
++def clean_runtime_environment(monkeypatch):
++    for key in ("WORK", "STALEMOM_OUT", "STALEMOM_CKPT", "STALEMOM_MIN_FREE_GIB"):
++        monkeypatch.delenv(key, raising=False)
++
++
++def test_environment_paths_keep_separate_run_checkpoints(tmp_path, monkeypatch):
++    monkeypatch.setenv("STALEMOM_OUT", str(tmp_path / "results"))
++    monkeypatch.setenv("STALEMOM_CKPT", str(tmp_path / "checkpoints"))
++    output = output_directory({"output_dir": "results/e5/l0"}, "results")
++    assert output == tmp_path / "results/e5/l0"
++    zero = checkpoint_directory({}, output / "train_k0")
++    stale = checkpoint_directory({}, output / "train_k2")
++    assert zero == tmp_path / "checkpoints/e5/l0/train_k0"
++    assert stale != zero
++    internal = {"output_dir": str(output / "train_k0"), "_paths_resolved": True}
++    assert output_directory(internal, "results") == output / "train_k0"
++    with pytest.raises(ValueError):
++        output_directory({"output_dir": str(output)}, "results")
++
++
++def test_default_paths_and_explicit_checkpoint_directory():
++    out = output_directory({}, "results/e5/l0")
++    assert checkpoint_directory({}, out) == Path("results/e5/l0/checkpoints")
++    assert checkpoint_directory({"_checkpoint_output_dir": "custom"}, out) == Path("custom")
++
++
++@pytest.mark.parametrize("data_free,system_free", [(9.99, 20), (20, 4.99)])
++def test_storage_guard_stops_at_either_disk_threshold(tmp_path, monkeypatch, data_free, system_free):
++    work = str(tmp_path / "work")
++    monkeypatch.setenv("WORK", work)
++    monkeypatch.setattr("llm.runtime.shutil.disk_usage", lambda path: types.SimpleNamespace(
++        free=(data_free if str(path) == work else system_free) * 2**30))
++    with pytest.raises(RuntimeError, match="Storage safety stop"):
++        check_storage()
++
++
++def test_chunked_float64_reduction_and_online_cosine():
++    from llm.train import compute_grad_norm_and_online_c1_gpu
++
++    left = torch.tensor([1e8, 3, -1e8, 5, 7], dtype=torch.float32)
++    right = torch.tensor([1, 2, 1, -3, 4], dtype=torch.float32)
++    assert tensor_inner64(left, right, chunk_elements=2).item() == np.dot(left.numpy().astype(np.float64), right.numpy().astype(np.float64))
++    model = torch.nn.Linear(2, 1, bias=False)
++    model.weight.grad = torch.tensor([[3., 4.]])
++    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
++    optimizer.state[model.weight]["momentum_buffer"] = torch.tensor([[0., 5.]])
++    norm, cosine = compute_grad_norm_and_online_c1_gpu(optimizer, model, "sgd_mom")
++    assert norm == pytest.approx(5)
++    assert cosine == pytest.approx(0.8)
++
++
++def test_environment_record_handles_cuda_available_with_no_visible_devices(tmp_path, monkeypatch):
++    import llm.run_l0 as runner
++
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
++    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: pytest.fail("No visible CUDA device"))
++    monkeypatch.setattr(runner, "write_llm_env_file", lambda out: (out / "env.txt").write_text("unit test fixture"))
++    pinned = runner.step1_record_environment(tmp_path)
++    assert pinned["gpu_name"] == "none" and pinned["cuda"] == "cpu"
++
++
++def test_vllm_limits_reach_engine_and_cache_is_freed_before_wake(monkeypatch):
++    import sys
++    from llm.train import RolloutBackend
++
++    events, options = [], {}
++    class Engine:
++        def __init__(self, **kwargs):
++            options.update(kwargs)
++        def sleep(self, level):
++            events.append("sleep")
++        def wake_up(self):
++            events.append("wake")
++        def apply_model(self, function):
++            function(types.SimpleNamespace(load_weights=lambda weights: events.append("weights")))
++    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(LLM=Engine))
++    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
++    limits = dict(enable_sleep_mode=True, gpu_memory_utilization=0.25, enforce_eager=True,
++                  max_model_len=2048, max_num_seqs=16, max_num_batched_tokens=512,
++                  enable_chunked_prefill=True, sync_method="apply_model")
++    backend = RolloutBackend("vllm", "test-fixture", types.SimpleNamespace(), "cpu", limits)
++    backend.sleep(); backend.sync_weights({"weight": torch.ones(2)})
++    assert events == ["sleep", "empty_cache", "wake", "weights"]
++    assert options["enforce_eager"] is True and options["max_num_seqs"] == 16
++    assert options["max_num_batched_tokens"] == 512
++    assert backend.sync_interface == "LLM.apply_model"
++
++
++def test_hf_batched_prompts_preserve_group_order_left_padding_and_response_masks():
++    from llm.train import RolloutBackend
++    from llm.data import GSM8KItem
++
++    calls = []
++    class Tokenizer:
++        pad_token_id, eos_token_id = 0, 2
++        def __call__(self, text, **_):
++            ids = {"short": [1, 3], "long": [1, 5, 6, 7], "middle": [1, 8, 9]}[text]
++            return {"input_ids": torch.tensor([ids])}
++        def decode(self, ids, **_):
++            return "\\boxed{3}" if ids[0] == 10 else "\\boxed{4}"
++    class Model:
++        def generate(self, input_ids, attention_mask, **_):
++            calls.append((input_ids.clone(), attention_mask.clone()))
++            response = torch.tensor([[10 + index % 2, 2, 0] for index in range(len(input_ids))])
++            return torch.cat([input_ids, response], dim=1)
++    def backend(batch_prompts):
++        result = object.__new__(RolloutBackend)
++        result.backend, result.device = "hf", torch.device("cpu")
++        result.tokenizer, result.hf_model = Tokenizer(), Model()
++        result.hf_batch_prompts = batch_prompts
++        return result
++    items = [GSM8KItem(index, text, "3", text) for index, text in enumerate(["short", "long", "middle"])]
++    combined = backend(2).generate_group_rollouts(items, group_size=2, temperature=1, top_p=1, max_new_tokens=3, seed=42)
++    assert len(calls) == 2
++    assert calls[0][0].tolist() == [[0, 0, 1, 3], [0, 0, 1, 3], [1, 5, 6, 7], [1, 5, 6, 7]]
++    assert calls[0][1].tolist() == [[0, 0, 1, 1], [0, 0, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]]
++    assert combined["prompt_lens"] == [2, 2, 4, 4, 3, 3]
++    assert combined["resp_lens"] == [2] * 6
++    np.testing.assert_array_equal(combined["rewards"], [1, 0, 1, 0, 1, 0])
++    np.testing.assert_array_equal(np.sign(combined["advantages"].numpy()), [1, -1, 1, -1, 1, -1])
++    np.testing.assert_allclose(np.abs(combined["advantages"].numpy()), 1, rtol=1e-5)
++    assert combined["response_mask"].sum().item() == 12
++    calls.clear()
++    separate = backend(1).generate_group_rollouts(items, group_size=2, temperature=1, top_p=1, max_new_tokens=3, seed=42)
++    assert len(calls) == 3
++    assert torch.equal(combined["input_ids"], separate["input_ids"])
++    assert torch.equal(combined["response_mask"], separate["response_mask"])
++
++
++def _training_rows(k, steps=10):
++    return [dict(step=i, loss=0.1, grad_norm=1, peak_vram_gb=12,
++                 nvidia_smi_peak_gb=13, dup_group_frac=0, mean_w=1,
++                 trunc_rate=0.1 if k and i >= k else 0, reward_mean=0.2,
++                 zero_adv_frac=0.5, step_time_gen=1, step_time_train=2, step_time_sync=0.1)
++            for i in range(steps)]
++
++
++def test_acceptance_rejects_missing_telemetry_nonfinite_grad_and_absent_truncation():
++    rows = _training_rows(2)
++    assert all(check["passed"] for check in training_checks(rows, 2, 22, 10))
++    rows[5]["grad_norm"] = float("nan")
++    rows[5]["trunc_rate"] = 0
++    for row in rows:
++        row["nvidia_smi_peak_gb"] = ""
++    failed = {check["check"] for check in training_checks(rows, 2, 22, 10) if not check["passed"]}
++    assert {"k2:finite_loss_and_grad", "k2:physical_peak_gib_sampled", "k2:trunc_rate_after_warmup"} <= failed
++    rows = _training_rows(0)
++    rows[2]["mean_w"] = 1 + 1e-12
++    assert not next(check for check in training_checks(rows, 0, 22, 10) if check["check"] == "k0:mean_w")["passed"]
++
++
++def test_sync_worker_exit_keeps_measured_logprob_errors_and_interface():
++    from llm.l0_pipeline import sync_failure_result
++
++    measured = {"passed": False, "logprob_mean_diff": 0.3, "logprob_max_diff": 2.0,
++                "sync_interface": "LLM.apply_model", "tol_mean_diff": 0.02}
++    failure = StageFailure("fixture", {"status": "complete", "result": measured, "worker_exit_code": -1})
++    result = sync_failure_result(failure, "vllm")
++    assert result["logprob_mean_diff"] == 0.3 and result["logprob_max_diff"] == 2.0
++    assert result["sync_interface"] == "LLM.apply_model" and result["worker_exit_code"] == -1
++    assert result["passed"] is False and "error" not in measured
++
++
++@pytest.mark.parametrize("snr,h,expected", [(0.05, 1, 64), (0.01, 1, 128), (0.009, 1, 256), (math.nan, 0, 256), (1, -1, 256)])
++def test_budget_tiers_and_unresolved_signal(snr, h, expected):
++    result = recommend_budget(snr, h)
++    assert result["recommended_K"] == expected
++    assert result["signal_detected"] is (h > 0)
++
++
++def test_stage_failure_stops_before_any_later_stage_and_writes_report(tmp_path, monkeypatch):
++    import llm.l0_pipeline as pipeline
++
++    out, seen = tmp_path / "output", []
++    config = tmp_path / "config.yaml"
++    config.write_text(yaml.safe_dump({"model": "test-fixture", "output_dir": str(out)}))
++    def fail(kind, label, *_):
++        seen.append(kind)
++        raise StageFailure(label, {"error_type": "TestFixtureFailure", "message": "fixture"})
++    monkeypatch.setattr(pipeline, "run_stage", fail)
++    with pytest.raises(StageFailure):
++        pipeline.run_l0_pipeline(str(config))
++    assert seen == ["env"]
++    assert json.loads((out / "l0_summary.json").read_text())["status"] == "stopped"
++    assert json.loads((out / "l0_summary.json").read_text())["step_status"]["1"] == "failed"
++    assert (out / "l0_report.md").exists()
++    assert "| 1 | failed |" in (out / "l0_report.md").read_text(encoding="utf-8")
++
++
++@pytest.mark.parametrize("initial_ooms,probe_enabled", [(1, False), (2, False), (0, True)])
++def test_pipeline_preserves_oom_attempt_and_runs_only_l0(tmp_path, monkeypatch, initial_ooms, probe_enabled):
++    import llm.l0_pipeline as pipeline
++
++    out, calls = tmp_path / "output", []
++    config = tmp_path / "config.yaml"
++    config.write_text(yaml.safe_dump({"model": "test-fixture", "output_dir": str(out),
++                                     "vllm": {"gpu_memory_utilization": 0.2}, "micro_batch_size": 4,
++                                     "gpu_price_yuan_per_hour": 2.68,
++                                     "smoke_checks": {"throughput_probe": probe_enabled}}))
++    def worker(kind, label, cfg, *_):
++        calls.append((kind, label, cfg.get("micro_batch_size"), cfg.get("vllm", {}).get("gpu_memory_utilization")))
++        if kind == "env":
++            result = {"torch": "fixture", "driver": "fixture"}
++        elif kind == "sync":
++            result = {"passed": True, "backend": "vllm", "sync_interface": "fixture", "logprob_mean_diff": 0.01}
++        elif kind == "train":
++            if label == "train_k0_attempt0" and initial_ooms >= 1 or label == "train_k0_attempt1" and initial_ooms >= 2:
++                raise StageFailure(label, {"error_type": "OutOfMemoryError", "message": "fixture"})
++            folder = Path(cfg["output_dir"]); folder.mkdir(parents=True)
++            rows = _training_rows(cfg["k"], cfg.get("steps", 10))
++            with (folder / "train_log.csv").open("w", newline="") as stream:
++                writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
++            paths = {}
++            for step in cfg.get("save_checkpoints_at", [0, 9]):
++                path = folder / f"fixture_{step}.pt"; path.write_bytes(b"unit-test-fixture")
++                paths[str(step)] = str(path)
++            result = {"output_dir": str(folder), "checkpoints": paths, "summary": {"diverged": False}}
++        else:
++            step = 0 if label == "diag_step0" else 9
++            result = {"diag_rows": [{"step": step, "S": 4, "R": 2, "SNR_hat": 0.05,
++                                    "H_hat": 0.1, "N_bar": 1, "sketch_rel_err": 0.01,
++                                    "zero_adv_frac": 0.5, "diag_time_sec": 1}]}
++        return {"status": "complete", "result": result, "physical_peak_gib": 13, "elapsed_seconds": 1}
++    monkeypatch.setattr(pipeline, "run_stage", worker)
++    summary = pipeline.run_l0_pipeline(str(config))
++    assert summary["status"] == "complete"
++    assert [call[0] for call in calls] == ["env", "sync"] + ["train"] * (2 + initial_ooms + int(probe_enabled)) + ["diag", "diag"]
++    if initial_ooms:
++        assert calls[3][2] == 2
++        assert summary["attempts"][2]["status"] == "failed"
++        if initial_ooms == 2:
++            assert calls[4][3] == 0.15
++    else:
++        assert calls[4][1:3] == ("throughput_mb8", 8)
++        assert summary["throughput_probe"]["steps"] == 3
++        assert summary["throughput_probe"]["adopted_for_later_stages"] is False
++    assert [row["step"] for row in summary["step4_mini_l2"]["rows"]] == [0, 9]
++    assert (out / "cost_estimates.csv").exists() and (out / "l0_report.md").exists()
++    assert summary["step5_estimates"]["gpu_price_yuan_per_hour"] == 2.68
++    with pytest.raises(FileExistsError):
++        pipeline.run_l0_pipeline(str(config))

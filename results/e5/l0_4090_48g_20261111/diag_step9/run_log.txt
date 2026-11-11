@@ -1,0 +1,1 @@
+[diag step=0009] H_hat=1.9276e-02 SNR=0.0326 C1=-0.0462 C1_pred=-0.0464 C2_hat=-0.2609 sketch_rel_err=0.0030 time=1438.15s

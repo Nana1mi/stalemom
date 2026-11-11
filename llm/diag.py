@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import numpy as np
 import torch
+from llm.runtime import tensor_inner64
 
 
 class CountSketch:
@@ -165,8 +166,7 @@ class OnlineLLMDiagAccumulator:
                 g_fp32 = g.detach().to(device=self.device, dtype=torch.float32)
 
             # Scalar norm squared accumulated in float64
-            g_f64 = g_fp32.to(dtype=torch.float64)
-            n_val += float(torch.sum(g_f64 * g_f64).item())
+            n_val += float(tensor_inner64(g_fp32).item())
 
             if m_dict is not None and name in m_dict and self.norm_m > 0.0:
                 m_t = m_dict[name]
@@ -174,7 +174,7 @@ class OnlineLLMDiagAccumulator:
                     m_fp32 = torch.as_tensor(m_t, dtype=torch.float32, device=self.device)
                 else:
                     m_fp32 = m_t.detach().to(device=self.device, dtype=torch.float32)
-                d_val += float(torch.sum(m_fp32.to(dtype=torch.float64) * g_f64).item())
+                d_val += float(tensor_inner64(m_fp32, g_fp32).item())
 
             # Vector accumulation in GPU fp32
             if name not in self._cur_Ts:
@@ -196,8 +196,7 @@ class OnlineLLMDiagAccumulator:
         norm_sq_Ts = 0.0
         target_half = self.sum_A if self._cur_s < (self.S // 2) else self.sum_B
         for name, ts in self._cur_Ts.items():
-            ts_f64 = ts.to(dtype=torch.float64)
-            norm_sq_Ts += float(torch.sum(ts_f64 * ts_f64).item())
+            norm_sq_Ts += float(tensor_inner64(ts).item())
             if name not in target_half:
                 target_half[name] = ts.clone()
             else:
@@ -229,9 +228,7 @@ class OnlineLLMDiagAccumulator:
         # Exact <A_bar, B_bar> from the two GPU fp32 half-sums, reduced in float64
         dot_AB_exact = 0.0
         for name in self.sum_A:
-            a64 = self.sum_A[name].to(dtype=torch.float64)
-            b64 = self.sum_B[name].to(dtype=torch.float64)
-            dot_AB_exact += float(torch.sum(a64 * b64).item())
+            dot_AB_exact += float(tensor_inner64(self.sum_A[name], self.sum_B[name]).item())
         H_exact_split = float(dot_AB_exact / (N_A * N_B))
 
         # Sketch-based A_bar and B_bar (accumulated in fp32, inner product in float64)

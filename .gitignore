@@ -16,3 +16,6 @@ results/e5/l0_local_verify/tiny_model/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+
+# Local access instructions contain a live server password.
+/CODEX_L0_4090_48G.md

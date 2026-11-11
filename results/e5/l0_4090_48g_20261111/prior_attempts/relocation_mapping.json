@@ -1,0 +1,14 @@
+{
+  "preserved_paths": {
+    "/root/work/results/e5/l0": "/root/work/results/e5/l0_unbatched_hf_20261111_123808",
+    "/root/work/checkpoints/e5/l0": "/root/work/checkpoints/e5/l0_unbatched_hf_20261111_123808",
+    "/root/work/l0_results.tar.gz": "/root/work/l0_unbatched_hf_20261111_123808.tar.gz"
+  },
+  "completed_train_rows": {
+    "0": 2,
+    "2": 0
+  },
+  "hf_batch_prompts_before": 1,
+  "hf_batch_prompts_after": 4,
+  "sampling_note": "Prompt count, group size and max generation length unchanged. Batched sampling changes RNG consumption; new run restarts seed42."
+}

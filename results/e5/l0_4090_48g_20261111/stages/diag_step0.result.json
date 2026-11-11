@@ -1,0 +1,65 @@
+{
+  "status": "complete",
+  "result": {
+    "diag_rows": [
+      {
+        "step": 0,
+        "S": 4,
+        "R": 2,
+        "prompts_per_set": 32,
+        "group_size": 4,
+        "k": 0,
+        "c": Infinity,
+        "norm_m": 0.0,
+        "reward_mean": 0.642578125,
+        "zero_adv_frac": 0.5390625,
+        "dup_group_frac": 0.0,
+        "trunc_rate": 0.0,
+        "approx_kl": 0.0,
+        "N_bar": 0.9145133824786897,
+        "N_bar_jk_se": 0.06599821945840627,
+        "H_hat": 0.013172539867341222,
+        "H_hat_jk_se": 0.0046269550086873,
+        "H_sketch": 0.013153212895039148,
+        "sketch_rel_err": 0.0014672168387200328,
+        "M": 0.013358248544032336,
+        "M_jk_se": 0.022819096382281606,
+        "var_total": 0.9013408426113485,
+        "var_total_jk_se": 0.06339105827984869,
+        "var_rollout": 0.9011551339346574,
+        "var_rollout_jk_se": 0.06231826155801172,
+        "var_prompt": 0.0001857086766911143,
+        "var_prompt_jk_se": 0.02566990759352005,
+        "prompt_var_frac": 0.00020603601646751351,
+        "rollout_var_frac": 0.9997939639835325,
+        "SNR_hat": 0.01461438253389026,
+        "SNR_hat_jk_se": 0.004685820550442131,
+        "C1": NaN,
+        "C1_jk_se": NaN,
+        "C1_pred": NaN,
+        "C1_pred_jk_se": NaN,
+        "C1_pred_legacy": NaN,
+        "C1_pred_legacy_jk_se": NaN,
+        "C2_hat": NaN,
+        "C2_hat_jk_se": NaN,
+        "diag_time_sec": 1172.744316719999,
+        "peak_vram_gb": 20.300975799560547,
+        "nvidia_smi_peak_gb": 22.990234375
+      }
+    ],
+    "c3_rows": [
+      {
+        "step_t": 0,
+        "step_s": 0,
+        "C3_hat": 1.0,
+        "H_hat_t": 0.013172539867341222,
+        "H_hat_s": 0.013172539867341222
+      }
+    ],
+    "diag_summary_csv": "/root/work/results/e5/l0/diag_step0/diag_summary.csv",
+    "c3_matrix_csv": "/root/work/results/e5/l0/diag_step0/c3_matrix.csv"
+  },
+  "physical_peak_gib": 22.990234375,
+  "elapsed_seconds": 1185.2441677380002,
+  "worker_exit_code": 0
+}

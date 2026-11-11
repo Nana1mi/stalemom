@@ -1,0 +1,324 @@
+{
+  "status": "interrupted_for_performance",
+  "checks": [
+    {
+      "check": "vllm_weight_sync",
+      "target": "mean absolute logprob difference < 0.02",
+      "value": null,
+      "passed": false
+    }
+  ],
+  "attempts": [
+    {
+      "stage": "env",
+      "label": "environment",
+      "micro_batch_size": 4,
+      "vllm": {
+        "enable_sleep_mode": true,
+        "gpu_memory_utilization": 0.2,
+        "enforce_eager": true,
+        "max_model_len": 4096,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 512,
+        "enable_chunked_prefill": true
+      },
+      "backend": "vllm",
+      "status": "complete",
+      "physical_peak_gib": 0.0,
+      "elapsed_seconds": 7.002434583000195
+    },
+    {
+      "stage": "sync",
+      "label": "sync_auto",
+      "micro_batch_size": 4,
+      "vllm": {
+        "enable_sleep_mode": true,
+        "gpu_memory_utilization": 0.2,
+        "enforce_eager": true,
+        "max_model_len": 4096,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 512,
+        "enable_chunked_prefill": true
+      },
+      "backend": "vllm",
+      "status": "failed",
+      "error": {
+        "status": "complete",
+        "result": {
+          "backend": "vllm",
+          "sync_interface": "driver_worker.model_runner.model.load_weights",
+          "sync_time_sec": 4.469640933999926,
+          "logprob_max_diff": 3.5473339557647705,
+          "logprob_mean_diff": 0.5818749666213989,
+          "tol_mean_diff": 0.02,
+          "dup_group_frac": 0.0,
+          "passed": false
+        },
+        "physical_peak_gib": 9.521484375,
+        "elapsed_seconds": 31.008812989000035
+      }
+    },
+    {
+      "stage": "sync",
+      "label": "sync_public_api",
+      "micro_batch_size": 4,
+      "vllm": {
+        "enable_sleep_mode": true,
+        "gpu_memory_utilization": 0.2,
+        "enforce_eager": true,
+        "max_model_len": 4096,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 512,
+        "enable_chunked_prefill": true,
+        "sync_method": "apply_model"
+      },
+      "backend": "vllm",
+      "status": "failed",
+      "error": {
+        "status": "complete",
+        "result": {
+          "backend": "vllm",
+          "sync_interface": "LLM.apply_model",
+          "sync_time_sec": 3.5848590270002205,
+          "logprob_max_diff": 3.5473339557647705,
+          "logprob_mean_diff": 0.5818749666213989,
+          "tol_mean_diff": 0.02,
+          "dup_group_frac": 0.0,
+          "passed": false
+        },
+        "physical_peak_gib": 9.521484375,
+        "elapsed_seconds": 29.008055280000008
+      }
+    },
+    {
+      "stage": "train",
+      "label": "train_k0_attempt0",
+      "micro_batch_size": 4,
+      "vllm": {
+        "enable_sleep_mode": true,
+        "gpu_memory_utilization": 0.2,
+        "enforce_eager": true,
+        "max_model_len": 4096,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 512,
+        "enable_chunked_prefill": true
+      },
+      "backend": "hf"
+    }
+  ],
+  "config": {
+    "phase": "l0",
+    "model": "Qwen/Qwen3-0.6B",
+    "enable_thinking": false,
+    "master_weights_dtype": "fp32",
+    "compute_dtype": "bf16",
+    "gradient_checkpointing": true,
+    "micro_batch_size": 4,
+    "vllm": {
+      "enable_sleep_mode": true,
+      "gpu_memory_utilization": 0.2,
+      "enforce_eager": true,
+      "max_model_len": 4096,
+      "max_num_seqs": 16,
+      "max_num_batched_tokens": 512,
+      "enable_chunked_prefill": true
+    },
+    "data": {
+      "dataset": "openai/gsm8k",
+      "train_pool_size": 1024,
+      "eval_pool_size": 500,
+      "seed": 42
+    },
+    "rollout": {
+      "prompts_per_step": 32,
+      "group_size": 4,
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "max_new_tokens": 512
+    },
+    "smoke_checks": {
+      "steps": 10,
+      "optimizer": "sgd_mom",
+      "momentum": 0.9,
+      "dampening": 0.0,
+      "lr": 0.01,
+      "k_values": [
+        0,
+        2
+      ],
+      "c": 1.2,
+      "max_vram_gb": 40.0,
+      "oom_gpu_memory_utilization": 0.15,
+      "throughput_probe": true,
+      "mini_l2": {
+        "S": 4,
+        "R": 2,
+        "sketch_dim": 4194304,
+        "max_sketch_rel_err": 0.05
+      }
+    },
+    "output_dir": "results/e5/l0",
+    "environment_min_free_gib": 70.0,
+    "gpu_price_yuan_per_hour": 2.68,
+    "rollout_backend": "vllm"
+  },
+  "output_dir": "/root/work/results/e5/l0",
+  "checkpoint_root": "/root/work/checkpoints/e5/l0",
+  "step_status": {
+    "1": "passed",
+    "2": "vllm_failed_hf_fallback",
+    "3": "interrupted",
+    "4": "not_run",
+    "5": "not_run"
+  },
+  "environment_setup": {
+    "time": "2026-11-11T11:41:12.803262",
+    "driver": "550.90.07",
+    "df_before": "Filesystem     Type  Size  Used Avail Use% Mounted on\n/dev/vda1      ext4   97G   13G   84G  14% /\n",
+    "disk_free_bytes_before": 89934114816,
+    "version_selection_reason": "Driver 550.90.07 reports CUDA 12.4 support. Use vLLM 0.8.5 CUDA 12.4 wheel and its required torch 2.6.0 instead of the CUDA 12.8 stack used on S17.",
+    "version_reference": "https://docs.vllm.ai/en/v0.8.5/getting_started/installation/gpu.html",
+    "network_note": "Direct HTTPS failed. Temporary loopback-only SSH reverse proxy used for public package/model downloads; no credentials copied to the server.",
+    "installation_note": "Conda environment completed. Slow initial mirror proxy was replaced by a physical-interface-routed SSH loopback tunnel before large dependency downloads.",
+    "python": "3.11.18 (main, Oct 26 2026, 18:19:35) [GCC 14.3.0]",
+    "torch": "2.6.0+cu124",
+    "torch_cuda": "12.4",
+    "vllm": "0.8.5",
+    "transformers": "4.51.3",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_total_bytes": 51002015744,
+    "disk_free_bytes_after_environment": 79168962560,
+    "cuda_matmul_validation": "passed",
+    "cached_assets": {
+      "model": "Qwen/Qwen3-0.6B",
+      "model_type": "qwen3",
+      "vocab_size": 151669,
+      "max_prompt_tokens_in_fixed_pools": 231,
+      "max_new_tokens": 512,
+      "max_model_len": 4096,
+      "dataset": {
+        "repo": "openai/gsm8k",
+        "config": "main",
+        "splits": {
+          "train": {
+            "rows": 7473,
+            "fingerprint": "c6f812ae33c9159d"
+          },
+          "test": {
+            "rows": 1319,
+            "fingerprint": "59ec1b7f9357c7a2"
+          }
+        }
+      },
+      "disk_free_bytes_before_l0": 79125778432
+    },
+    "model_cache_manifest": {
+      "model": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+      "snapshot": "/root/work/hf_cache/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "files": [
+        {
+          "file": "config.json",
+          "bytes": 726,
+          "digest": "f5c3703b78ae2a478ae15b247e9f855e0ce2107b",
+          "verified": true
+        },
+        {
+          "file": "generation_config.json",
+          "bytes": 239,
+          "digest": "20a8a9156fc8c3f25295ca067f61fdf120d517c5",
+          "verified": true
+        },
+        {
+          "file": "merges.txt",
+          "bytes": 1671853,
+          "digest": "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7",
+          "verified": true
+        },
+        {
+          "file": "model.safetensors",
+          "bytes": 1503300328,
+          "digest": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+          "verified": true
+        },
+        {
+          "file": "tokenizer.json",
+          "bytes": 11422654,
+          "digest": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+          "verified": true
+        },
+        {
+          "file": "tokenizer_config.json",
+          "bytes": 9732,
+          "digest": "417d038a63fa3de29cfde265caedae14d1a58d92",
+          "verified": true
+        },
+        {
+          "file": "vocab.json",
+          "bytes": 2776833,
+          "digest": "4783fe10ac3adce15ac8f358ef5462739852c569",
+          "verified": true
+        }
+      ],
+      "completed_at": "2026-11-11T12:13:19.397409",
+      "weight_source": "https://www.modelscope.cn/models/Qwen/Qwen3-0.6B/resolve/master/model.safetensors",
+      "method": "Validated HTTP ranges; assembled SHA256 verified against official Hugging Face metadata. Final registration used Python 3.11."
+    },
+    "unit_tests": {
+      "tests": "149",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "9.576"
+    },
+    "offline_assets_validation": "passed",
+    "prelaunch_attempt": {
+      "exit_code": 127,
+      "reason": "A CRLF terminator on the temporary bootstrap final command prevented L0 from starting. Rewritten with LF; no training outputs existed.",
+      "preserved_artifacts": "/root/work/results/e5/l0_prelaunch_crlf_20261111_121537"
+    }
+  },
+  "storage_before": {
+    "work": "/root/work",
+    "data_free_gib": 73.6914291381836,
+    "system_free_gib": 73.6914291381836,
+    "minimum_free_gib": 15.0
+  },
+  "df_before": "Filesystem                                         Size  Used Avail Use% Mounted on\ntmpfs                                              8.8G  1.4M  8.8G   1% /run\n/dev/vda1                                           97G   24G   74G  24% /\ntmpfs                                               44G     0   44G   0% /dev/shm\ntmpfs                                              5.0M     0  5.0M   0% /run/lock\n/dev/vda15                                         105M  6.3M   99M   7% /boot/efi\n//nm2.storage.spacehpc.com/smb_user_3h7tevy1rst8n   30T   29T  1.1T  97% /mnt/storage\n//nm2.pub.storage.spacehpc.com/pub_data             22T   21T  1.1T  96% /mnt/pub_storage\ntmpfs                                              8.8G  8.0K  8.8G   1% /run/user/0\n",
+  "step1_env": {
+    "torch": "2.6.0+cu124",
+    "vllm": "0.8.5",
+    "transformers": "4.51.3",
+    "cuda": "12.4",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "vram_total_gb": "47.50",
+    "driver": "550.90.07",
+    "git_commit": "67932fe6fb982e4fc2d7d60b5ae4ceec7b13e216"
+  },
+  "initial_sync_error": "sync_auto: failure: ",
+  "step2_weight_sync": {
+    "passed": false,
+    "backend": "vllm",
+    "error": "sync_public_api: failure: "
+  },
+  "backend_for_steps_3_4": "hf",
+  "step3_runs": {},
+  "error_type": "KeyboardInterrupt",
+  "error": "",
+  "traceback": "Traceback (most recent call last):\n  File \"/root/work/stalemom/llm/l0_pipeline.py\", line 217, in run_l0_pipeline\n    result = attempt(\"train\", folder, run)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/root/work/stalemom/llm/l0_pipeline.py\", line 151, in attempt\n    payload = run_stage(kind, label, cfg, out, timeout)\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/root/work/stalemom/llm/l0_pipeline.py\", line 59, in run_stage\n    time.sleep(1)\nKeyboardInterrupt\n",
+  "storage_after": {
+    "work": "/root/work",
+    "data_free_gib": 70.89065933227539,
+    "system_free_gib": 70.89065933227539,
+    "minimum_free_gib": 15.0
+  },
+  "interruption": {
+    "reason": "User approved optimizing HF prompt batching and restarting L0 from fixed seed. No scientific results discarded; original attempt preserved separately.",
+    "completed_train_rows": {
+      "0": 2,
+      "2": 0
+    },
+    "time": "2026-11-11T12:38:08.628156",
+    "original_controller_status": "stopped"
+  }
+}

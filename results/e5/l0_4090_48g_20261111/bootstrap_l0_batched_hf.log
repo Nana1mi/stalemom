@@ -1,0 +1,16 @@
+........................................................................ [ 47%]
+........................................................................ [ 95%]
+.......                                                                  [100%]
+151 passed in 9.82s
+ASSETS_AND_DEPLOYMENT_VALIDATED {"model": "Qwen/Qwen3-0.6B", "model_type": "qwen3", "vocab_size": 151669, "max_prompt_tokens_in_fixed_pools": 231, "max_new_tokens": 512, "max_model_len": 4096, "dataset": {"repo": "openai/gsm8k", "config": "main", "splits": {"train": {"rows": 7473, "fingerprint": "c6f812ae33c9159d"}, "test": {"rows": 1319, "fingerprint": "59ec1b7f9357c7a2"}}}, "disk_free_bytes_before_l0": 76117516288}
+Using the latest cached version of the dataset since openai/gsm8k couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'main' at /root/work/hf_cache/datasets/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866 (last modified on Wed Nov 11 12:14:17 2026).
+OFFLINE_ASSETS_VERIFIED {'train': 7473, 'test': 1319}
+[L0] environment completed; physical peak=0.0 GiB
+[L0] train_k0_attempt0 completed; physical peak=20.359375 GiB
+[L0] train_k2_attempt0 completed; physical peak=20.39453125 GiB
+[L0] throughput_mb8 completed; physical peak=18.658203125 GiB
+[L0] diag_step0 completed; physical peak=22.990234375 GiB
+[L0] diag_step9 completed; physical peak=29.208984375 GiB
+-rw------- 1 root root 60M Nov 11 14:26 /root/work/l0_results.tar.gz
+BOOTSTRAP_AND_L0_EXIT=0

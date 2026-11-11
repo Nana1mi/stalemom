@@ -15,6 +15,8 @@ import numpy as np
 import yaml
 
 from llm.reward import compute_exact_match_reward, compute_grpo_advantages
+from llm.runtime import (output_directory, checkpoint_directory, check_storage,
+                         tensor_inner64, physical_peak_gib)
 
 
 def compute_token_weights_numpy(
@@ -402,13 +404,13 @@ def compute_grad_norm_and_online_c1_gpu(
     for _, p in model.named_parameters():
         if not p.requires_grad or p.grad is None:
             continue
-        g64 = p.grad.detach().to(dtype=torch.float64)
+        grad = p.grad.detach()
         if norm_g_sq is None:
-            dev = g64.device
+            dev = grad.device
             dot = torch.zeros((), dtype=torch.float64, device=dev)
             norm_m_sq = torch.zeros((), dtype=torch.float64, device=dev)
             norm_g_sq = torch.zeros((), dtype=torch.float64, device=dev)
-        norm_g_sq = norm_g_sq + torch.sum(g64 * g64)
+        norm_g_sq = norm_g_sq + tensor_inner64(grad)
 
         state = optimizer.state.get(p, {})
         buf = None
@@ -418,9 +420,8 @@ def compute_grad_norm_and_online_c1_gpu(
             buf = state.get("exp_avg", None)
 
         if buf is not None:
-            m64 = buf.detach().to(device=g64.device, dtype=torch.float64)
-            norm_m_sq = norm_m_sq + torch.sum(m64 * m64)
-            dot = dot + torch.sum(m64 * g64)
+            norm_m_sq = norm_m_sq + tensor_inner64(buf)
+            dot = dot + tensor_inner64(buf, grad)
 
     if norm_g_sq is None:
         return 0.0, float("nan")
@@ -525,8 +526,7 @@ def extract_momentum_buffers(optimizer, model, opt_name: str) -> tuple[dict[str,
         if buf is not None:
             buf_cpu = buf.detach().to(device="cpu", dtype=torch.float32).clone()
             m_dict[name] = buf_cpu
-            b64 = buf.detach().to(dtype=torch.float64)
-            norm_m_sq += float(torch.sum(b64 * b64).item())
+            norm_m_sq += float(tensor_inner64(buf).item())
 
     return m_dict, sq_dict, float(np.sqrt(norm_m_sq))
 
@@ -543,6 +543,7 @@ class RolloutBackend:
         vllm_cfg: dict | None = None,
         use_bf16: bool = True,
         seed: int = 42,
+        hf_batch_prompts: int = 1,
     ):
         import torch
         from transformers import AutoModelForCausalLM
@@ -553,9 +554,14 @@ class RolloutBackend:
         self.device = torch.device(device)
         self.use_bf16 = bool(use_bf16)
         self.seed = int(seed)
+        self.hf_batch_prompts = int(hf_batch_prompts)
+        if self.hf_batch_prompts < 1:
+            raise ValueError("hf_batch_prompts must be positive")
         vcfg = vllm_cfg or {}
         self.enable_sleep_mode = bool(vcfg.get("enable_sleep_mode", True))
         self._is_sleeping = False
+        self.sync_interface = None
+        self.sync_method = vcfg.get("sync_method", "auto")
 
         if self.backend == "hf":
             dtype = torch.bfloat16 if (self.use_bf16 and self.device.type == "cuda") else torch.float32
@@ -565,6 +571,10 @@ class RolloutBackend:
             self.vllm_engine = None
         elif self.backend == "vllm":
             from vllm import LLM
+            options = {name: vcfg[name] for name in (
+                "enforce_eager", "max_model_len", "max_num_seqs",
+                "max_num_batched_tokens", "enable_chunked_prefill",
+            ) if name in vcfg}
             self.vllm_engine = LLM(
                 model=model_name,
                 dtype="bfloat16",
@@ -572,6 +582,7 @@ class RolloutBackend:
                 gpu_memory_utilization=float(vcfg.get("gpu_memory_utilization", 0.30)),
                 seed=int(vcfg.get("seed", self.seed)),
                 trust_remote_code=True,
+                **options,
             )
             self.hf_model = None
         else:
@@ -588,6 +599,8 @@ class RolloutBackend:
         """Wake up vLLM engine before weight synchronization or rollout generation."""
         if self.backend == "vllm" and self.vllm_engine is not None and self.enable_sleep_mode:
             if self._is_sleeping and hasattr(self.vllm_engine, "wake_up"):
+                import torch
+                torch.cuda.empty_cache()
                 self.vllm_engine.wake_up()
                 self._is_sleeping = False
 
@@ -603,18 +616,24 @@ class RolloutBackend:
             }
             self.hf_model.load_state_dict(cast_sd, strict=True)
             self.hf_model.eval()
+            self.sync_interface = "hf.load_state_dict"
         elif self.backend == "vllm":
             self.wake_up()
             weights = [
                 (k, v.to(dtype=torch.bfloat16))
                 for k, v in fp32_state_dict.items()
             ]
+            if self.sync_method == "apply_model":
+                self.vllm_engine.apply_model(lambda m: m.load_weights(weights))
+                self.sync_interface = "LLM.apply_model"
+                return
             # 1. Try direct V0 driver_worker.model_runner path first
             try:
                 model_runner = (
                     self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner
                 )
                 model_runner.model.load_weights(weights)
+                self.sync_interface = "driver_worker.model_runner.model.load_weights"
                 return
             except AttributeError:
                 pass
@@ -624,17 +643,20 @@ class RolloutBackend:
                     self.vllm_engine.llm_engine.model_executor.driver_worker.worker.model_runner
                 )
                 model_runner.model.load_weights(weights)
+                self.sync_interface = "driver_worker.worker.model_runner.model.load_weights"
                 return
             except AttributeError:
                 pass
             # 3. Fallback to public vLLM apply_model API (vLLM V1 / 0.7+)
             if hasattr(self.vllm_engine, "apply_model"):
                 self.vllm_engine.apply_model(lambda m: m.load_weights(weights))
+                self.sync_interface = "LLM.apply_model"
                 return
             if hasattr(self.vllm_engine, "llm_engine") and hasattr(self.vllm_engine.llm_engine, "model_executor"):
                 executor = self.vllm_engine.llm_engine.model_executor
                 if hasattr(executor, "apply_model"):
                     executor.apply_model(lambda m: m.load_weights(weights))
+                    self.sync_interface = "model_executor.apply_model"
                     return
             raise RuntimeError("Unable to synchronize weights into vLLM engine via driver_worker or apply_model")
 
@@ -668,12 +690,18 @@ class RolloutBackend:
             if seed is not None:
                 torch.manual_seed(int(seed))
             with torch.no_grad():
-                for item in items:
-                    enc = self.tokenizer(item.prompt_text, return_tensors="pt", add_special_tokens=False)
-                    p_ids = enc["input_ids"].to(self.device)
-                    p_len = int(p_ids.shape[1])
-                    p_ids_rep = p_ids.repeat(group_size, 1)
-                    attn_rep = torch.ones_like(p_ids_rep)
+                for start in range(0, len(items), self.hf_batch_prompts):
+                    batch_items = items[start : start + self.hf_batch_prompts]
+                    prompts = [self.tokenizer(item.prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+                               for item in batch_items]
+                    prompt_width = max(map(len, prompts))
+                    p_ids_rep = torch.full((len(batch_items) * group_size, prompt_width), pad_id,
+                                           dtype=torch.long, device=self.device)
+                    attn_rep = torch.zeros_like(p_ids_rep)
+                    for index, ids in enumerate(prompts):
+                        group = slice(index * group_size, (index + 1) * group_size)
+                        p_ids_rep[group, -len(ids):] = torch.tensor(ids, dtype=torch.long, device=self.device)
+                        attn_rep[group, -len(ids):] = 1
 
                     gen_out = self.hf_model.generate(
                         input_ids=p_ids_rep,
@@ -685,16 +713,19 @@ class RolloutBackend:
                         pad_token_id=pad_id,
                         eos_token_id=eos_id,
                     )
-                    for g_idx in range(group_size):
-                        seq = gen_out[g_idx].tolist()
+                    for row_idx in range(len(batch_items) * group_size):
+                        item_idx = row_idx // group_size
+                        item = batch_items[item_idx]
+                        p_len = len(prompts[item_idx])
+                        seq = gen_out[row_idx].tolist()
                         # Trim trailing pad tokens after EOS
-                        resp_part = seq[p_len:]
+                        resp_part = seq[prompt_width:]
                         if eos_id is not None and eos_id in resp_part:
                             first_eos = resp_part.index(eos_id)
                             resp_part = resp_part[: first_eos + 1]
                         if len(resp_part) == 0:
                             resp_part = [eos_id if eos_id is not None else 0]
-                        full_seq = seq[:p_len] + resp_part
+                        full_seq = prompts[item_idx] + resp_part
                         text = self.tokenizer.decode(resp_part, skip_special_tokens=True)
                         rew = compute_exact_match_reward(text, item.ground_truth)
 
@@ -914,7 +945,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
     else:
         cfg = copy.deepcopy(config)
 
-    out_dir = Path(cfg.get("output_dir", cfg.get("out_dir", "results/e5/l0")))
+    out_dir = output_directory(cfg, "results/e5/l0")
     out_dir.mkdir(parents=True, exist_ok=True)
     write_llm_env_file(out_dir)
 
@@ -994,6 +1025,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
         vllm_cfg=cfg.get("vllm", {}),
         use_bf16=use_bf16,
         seed=seed,
+        hf_batch_prompts=int(rollout_cfg.get("hf_batch_prompts", 1)),
     )
 
     optimizer = build_optimizer(
@@ -1003,7 +1035,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
 
     log_file = out_dir / "run_log.txt"
     csv_file = out_dir / "train_log.csv"
-    ckpt_dir = out_dir / "checkpoints"
+    ckpt_dir = checkpoint_directory(cfg, out_dir)
 
     rng = np.random.default_rng(seed)
     step_rows = []
@@ -1029,6 +1061,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
         "step_time_train",
         "step_time_sync",
         "peak_vram_gb",
+        "nvidia_smi_peak_gb",
     ]
 
     with open(csv_file, "w", newline="", encoding="utf-8") as cf:
@@ -1036,6 +1069,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
         writer.writeheader()
 
         for step in range(steps):
+            check_storage()
             # Push current fp32 snapshot theta_t into staleness ring buffer
             staleness_buf.push(step, model.state_dict())
             behav_sd = staleness_buf.get_behavior_weights(step)
@@ -1146,6 +1180,7 @@ def main(config: dict | str | Path) -> dict[str, Any]:
                 "step_time_train": step_time_train,
                 "step_time_sync": step_time_sync,
                 "peak_vram_gb": peak_vram_gb,
+                "nvidia_smi_peak_gb": physical_peak_gib(),
             }
             step_rows.append(row)
             writer.writerow(row)

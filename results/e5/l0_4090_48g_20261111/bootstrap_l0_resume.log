@@ -1,0 +1,3 @@
+[L0] environment completed; physical peak=0.0 GiB
+-rw------- 1 root root 70K Nov 11 12:34 /root/work/l0_results.tar.gz
+BOOTSTRAP_AND_L0_EXIT=0

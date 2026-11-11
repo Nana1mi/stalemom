@@ -1,0 +1,19 @@
+{
+  "source_unbatched": "/root/work/results/e5/l0_unbatched_hf_20261111_123808/train_k0_attempt0/train_log.csv",
+  "source_batched": "/root/work/results/e5/l0/train_k0_attempt0/train_log.csv",
+  "comparison": "First completed step, same settings except prompt batching. Sampled sequences differ due RNG consumption. Initial measurement only, not controlled benchmark.",
+  "before_hf_batch_prompts": 1,
+  "after_hf_batch_prompts": 4,
+  "before_generation_seconds": 375.85353426300026,
+  "after_generation_seconds": 141.03787660499984,
+  "generation_speedup": 2.6649120315079684,
+  "before_sum_stage_seconds": 389.22364341,
+  "after_sum_stage_seconds": 154.19224851799936,
+  "sum_stage_speedup": 2.5242750342574105,
+  "torch_peak_gib": 11.372558116912842,
+  "physical_peak_gib_sampled": 15.783203125,
+  "price_yuan_per_hour": 2.68,
+  "projection_note": "Crude total estimate based on1training step and39train-equivalent batches. Diagnostics overhead and token lengths vary.",
+  "projected_cost_yuan": 4.476714948639248,
+  "total_l0_39batch_equivalent_projection_hours": 1.6704160256116598
+}

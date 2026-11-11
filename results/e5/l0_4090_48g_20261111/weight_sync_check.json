@@ -1,0 +1,12 @@
+{
+  "backend": "vllm",
+  "sync_interface": "LLM.apply_model",
+  "sync_time_sec": 3.797737288999997,
+  "logprob_max_diff": 3.5473339557647705,
+  "logprob_mean_diff": 0.5818749666213989,
+  "tol_mean_diff": 0.02,
+  "dup_group_frac": 0.0,
+  "passed": false,
+  "error": "sync_public_api: failure: ",
+  "worker_exit_code": -6
+}

@@ -1,0 +1,10 @@
+[step 000/010] loss=-0.0091 reward=0.586 zero_adv=0.50 dup_grp=0.00 grad_norm=1.0756 C1=nan trunc=0.0000 sync_max_diff=2.35e-01 vram=11.37GB eval_acc=nan
+[step 001/010] loss=-0.0094 reward=0.641 zero_adv=0.59 dup_grp=0.00 grad_norm=0.8298 C1=-0.0327 trunc=0.0000 sync_max_diff=5.36e-01 vram=13.61GB eval_acc=nan
+[step 002/010] loss=0.0023 reward=0.695 zero_adv=0.59 dup_grp=0.00 grad_norm=0.9395 C1=-0.0288 trunc=0.0000 sync_max_diff=3.11e-01 vram=13.61GB eval_acc=nan
+[step 003/010] loss=-0.0107 reward=0.547 zero_adv=0.66 dup_grp=0.00 grad_norm=0.8128 C1=-0.0141 trunc=0.0000 sync_max_diff=3.54e-01 vram=13.68GB eval_acc=nan
+[step 004/010] loss=-0.0071 reward=0.703 zero_adv=0.47 dup_grp=0.00 grad_norm=0.9155 C1=-0.0340 trunc=0.0000 sync_max_diff=3.41e-01 vram=13.68GB eval_acc=nan
+[step 005/010] loss=-0.0157 reward=0.703 zero_adv=0.69 dup_grp=0.00 grad_norm=0.7210 C1=-0.0104 trunc=0.0000 sync_max_diff=2.42e-01 vram=13.68GB eval_acc=nan
+[step 006/010] loss=-0.0178 reward=0.727 zero_adv=0.56 dup_grp=0.00 grad_norm=0.9360 C1=-0.0066 trunc=0.0000 sync_max_diff=3.45e-01 vram=13.68GB eval_acc=nan
+[step 007/010] loss=0.0108 reward=0.758 zero_adv=0.53 dup_grp=0.00 grad_norm=0.9471 C1=0.0063 trunc=0.0000 sync_max_diff=3.46e-01 vram=13.68GB eval_acc=nan
+[step 008/010] loss=-0.0159 reward=0.711 zero_adv=0.56 dup_grp=0.00 grad_norm=0.9404 C1=0.0004 trunc=0.0000 sync_max_diff=2.50e-01 vram=13.73GB eval_acc=nan
+[step 009/010] loss=-0.0761 reward=0.594 zero_adv=0.41 dup_grp=0.00 grad_norm=0.9879 C1=-0.0210 trunc=0.0000 sync_max_diff=2.23e-01 vram=13.73GB eval_acc=nan

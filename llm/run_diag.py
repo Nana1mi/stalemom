@@ -18,6 +18,7 @@ from llm.train import (
     write_llm_env_file,
 )
 from stalemom.diag import compute_c3
+from llm.runtime import output_directory, checkpoint_directory, check_storage, physical_peak_gib
 
 
 def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
@@ -30,7 +31,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
     else:
         cfg = copy.deepcopy(config)
 
-    out_dir = Path(cfg.get("output_dir", cfg.get("out_dir", "results/e5/l2")))
+    out_dir = output_directory(cfg, "results/e5/l2")
     out_dir.mkdir(parents=True, exist_ok=True)
     write_llm_env_file(out_dir)
 
@@ -85,9 +86,9 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
     if "checkpoint_paths" in cfg:
         ckpt_paths = [Path(p) for p in cfg["checkpoint_paths"]]
     else:
-        ckpt_dir = Path(cfg.get("checkpoint_dir", out_dir / "checkpoints"))
+        ckpt_dir = Path(cfg.get("checkpoint_dir", checkpoint_directory(cfg, out_dir)))
         if not ckpt_dir.exists():
-            ckpt_dir = Path(cfg.get("checkpoint_dir", out_dir.parent / "l1" / "checkpoints"))
+            ckpt_dir = Path(cfg.get("checkpoint_dir", checkpoint_directory({}, out_dir.parent / "l1")))
         target_steps = cfg.get("checkpoints", cfg.get("save_checkpoints_at", [0, 50, 100]))
         for st in target_steps:
             candidate = ckpt_dir / f"ckpt_step_{int(st):04d}.pt"
@@ -118,6 +119,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
         vllm_cfg=cfg.get("vllm", {}),
         use_bf16=use_bf16,
         seed=seed,
+        hf_batch_prompts=int(nested_cfg.get("hf_batch_prompts", cfg.get("rollout", {}).get("hf_batch_prompts", 1))),
     )
 
     rng = np.random.default_rng(seed + 1000)
@@ -132,6 +134,9 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
     log_file = out_dir / "run_log.txt"
 
     for ckpt_path in ckpt_paths:
+        check_storage()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         step = int(payload["step"])
@@ -180,6 +185,7 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
             acc.begin_set(s_idx)
             set_items = prompt_sets[s_idx]
             for r_idx in range(R):
+                check_storage()
                 rollout_seed = seed + step * 10000 + s_idx * 100 + r_idx
                 rollout_engine.wake_up()
                 rb = rollout_engine.generate_group_rollouts(
@@ -281,6 +287,8 @@ def run_checkpoint_diagnostics(config: dict | str | Path) -> dict[str, Any]:
             "C2_hat": res["C2_hat"],
             "C2_hat_jk_se": res["C2_hat_jk_se"],
             "diag_time_sec": diag_time,
+            "peak_vram_gb": float(torch.cuda.max_memory_allocated(device) / 2**30) if device.type == "cuda" else 0.0,
+            "nvidia_smi_peak_gb": physical_peak_gib(),
         }
         diag_rows.append(row)
 

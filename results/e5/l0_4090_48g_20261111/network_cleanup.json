@@ -1,0 +1,10 @@
+{
+  "time": "2026-11-11T14:28:06.103992",
+  "temporary_loopback_proxy_exports_removed": 2,
+  "other_environment_settings_preserved": true,
+  "model_and_dataset_cached_offline": true,
+  "local_tunnel_shutdown": "Verified remote loopback listeners closed after stopping only the two local task-specific helper processes.",
+  "loopback_proxy_listeners_closed": true,
+  "checked_at": "2026-11-11T14:29:13.251985",
+  "global_clash_settings_modified": false
+}

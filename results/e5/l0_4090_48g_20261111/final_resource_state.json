@@ -1,0 +1,10 @@
+{
+  "time": "2026-11-11T14:30:11.846278",
+  "l0_status": "complete_with_hf_fallback",
+  "bootstrap_exit_code": 0,
+  "gpu_compute_processes": [],
+  "disk_free_gib": 49.52785110473633,
+  "L1_L4_started": false,
+  "server_shutdown": false,
+  "billing_changed": false
+}

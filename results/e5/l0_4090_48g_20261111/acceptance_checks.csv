@@ -1,0 +1,16 @@
+check,target,value,passed
+vllm_weight_sync,mean absolute logprob difference < 0.02,0.5818749666213989,False
+k0:steps,10,10,True
+k0:finite_loss_and_grad,all finite,True,True
+k0:torch_peak_gib,< 40.0,13.727941513061523,True
+k0:physical_peak_gib_sampled,< 40.0,20.359375,True
+k0:dup_group_frac,< 0.05,0.0,True
+k0:mean_w,exactly 1,"[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]",True
+k2:steps,10,10,True
+k2:finite_loss_and_grad,all finite,True,True
+k2:torch_peak_gib,< 40.0,13.774137020111084,True
+k2:physical_peak_gib_sampled,< 40.0,20.39453125,True
+k2:dup_group_frac,< 0.05,0.0,True
+k2:trunc_rate_after_warmup,> 0 at every step >= k,"[0.028144853875476494, 0.03771786492374728, 0.04154193903109536, 0.04381581295734428, 0.04573034043697881, 0.04808760024676126, 0.056633233651785006, 0.0636515126622386]",True
+diag_step0:sketch_rel_err,< 0.05,0.0014672168387200328,True
+diag_step9:sketch_rel_err,< 0.05,0.0030400284476720194,True

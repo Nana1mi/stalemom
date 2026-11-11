@@ -1,0 +1,2 @@
+model,optimizer,lr,momentum,effective_lr,k,c,seed,steps,final_reward_mean,final_eval_acc,mean_zero_adv_frac,mean_dup_group_frac,diverged,mean_step_time_gen,mean_step_time_train,mean_step_time_sync,max_sync_logprob_diff,peak_vram_gb
+Qwen/Qwen3-0.6B,sgd_mom,0.01,0.9,0.10000000000000002,2,1.2,42,10,0.5625,nan,0.5375,0.0,False,143.2394680947,13.39906506999996,1.9184359949000283,0.4756488800048828,13.774137020111084

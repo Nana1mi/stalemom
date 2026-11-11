@@ -1,0 +1,17 @@
+{
+  "archive_sha256": "219ca6aad41dae7dc26e9b62953baf8bf19bfd5751d7b48fea87fc962761d06b",
+  "credential_absent": true,
+  "checkpoint_files_absent": true,
+  "path_traversal_absent": true,
+  "status": "complete_with_hf_fallback",
+  "step_status": {
+    "1": "passed",
+    "2": "vllm_failed_hf_fallback",
+    "3": "passed",
+    "4": "passed",
+    "5": "passed"
+  },
+  "tests_directory_modified": false,
+  "training_csv_acceptance": true,
+  "diagnostics_csv_acceptance": true
+}

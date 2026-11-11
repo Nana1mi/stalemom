@@ -1,0 +1,56 @@
+Using the latest cached version of the dataset since openai/gsm8k couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'main' at /root/work/hf_cache/datasets/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866 (last modified on Wed Nov 11 12:14:17 2026).
+INFO 11-11 12:39:55 [importing.py:53] Triton module has been replaced with a placeholder.
+INFO 11-11 12:39:56 [__init__.py:239] Automatically detected platform cuda.
+INFO 11-11 12:40:05 [config.py:717] This model supports multiple tasks: {'generate', 'score', 'classify', 'reward', 'embed'}. Defaulting to 'generate'.
+INFO 11-11 12:40:05 [config.py:2003] Chunked prefill is enabled with max_num_batched_tokens=512.
+WARNING 11-11 12:40:05 [cuda.py:93] To see benefits of async output processing, enable CUDA graph. Since, enforce-eager is enabled, async output processor cannot be used
+INFO 11-11 12:40:07 [core.py:58] Initializing a V1 LLM engine (v0.8.5) with config: model='Qwen/Qwen3-0.6B', speculative_config=None, tokenizer='Qwen/Qwen3-0.6B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, override_neuron_config=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=4096, download_dir=None, load_format=LoadFormat.AUTO, tensor_parallel_size=1, pipeline_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, kv_cache_dtype=auto,  device_config=cuda, decoding_config=DecodingConfig(guided_decoding_backend='auto', reasoning_backend=None), observability_config=ObservabilityConfig(show_hidden_metrics=False, otlp_traces_endpoint=None, collect_model_forward_time=False, collect_model_execute_time=False), seed=42, served_model_name=Qwen/Qwen3-0.6B, num_scheduler_steps=1, multi_step_stream_outputs=True, enable_prefix_caching=True, chunked_prefill_enabled=True, use_async_output_proc=False, disable_mm_preprocessor_cache=False, mm_processor_kwargs=None, pooler_config=None, compilation_config={"splitting_ops":[],"compile_sizes":[],"cudagraph_capture_sizes":[],"max_capture_size":0}
+WARNING 11-11 12:40:07 [utils.py:2522] Methods determine_num_available_blocks,device_config,get_cache_block_size_bytes,initialize_cache not implemented in <vllm.v1.worker.gpu_worker.Worker object at 0x7efbec945990>
+INFO 11-11 12:40:07 [parallel_state.py:1004] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0
+INFO 11-11 12:40:07 [cuda.py:221] Using Flash Attention backend on V1 engine.
+WARNING 11-11 12:40:07 [topk_topp_sampler.py:69] FlashInfer is not available. Falling back to the PyTorch-native implementation of top-p & top-k sampling. For the best performance, please install FlashInfer.
+INFO 11-11 12:40:07 [gpu_model_runner.py:1329] Starting to load model Qwen/Qwen3-0.6B...
+INFO 11-11 12:40:07 [weight_utils.py:265] Using model weights format ['*.safetensors', '*.bin', '*.pt']
+INFO 11-11 12:40:07 [weight_utils.py:315] No model.safetensors.index.json found in remote.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.34it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.34it/s]
+
+INFO 11-11 12:40:08 [loader.py:458] Loading weights took 0.45 seconds
+INFO 11-11 12:40:08 [gpu_model_runner.py:1347] Model loading took 1.1201 GiB and 0.557864 seconds
+INFO 11-11 12:40:09 [kv_cache_utils.py:634] GPU KV cache size: 51,584 tokens
+INFO 11-11 12:40:09 [kv_cache_utils.py:637] Maximum concurrency for 4,096 tokens per request: 12.59x
+INFO 11-11 12:40:09 [core.py:159] init engine (profile, create kv cache, warmup model) took 0.56 seconds
+INFO 11-11 12:40:14 [block_pool.py:264] Successfully reset prefix cache
+INFO 11-11 12:40:17 [gpu_worker.py:95] Sleep mode freed 6.82 GiB memory, 2.70 GiB memory is still in use.
+INFO 11-11 12:40:17 [executor_base.py:210] It took 2.912504 seconds to fall asleep.
+[rank0]:[W1111 12:40:18.817082851 ProcessGroupNCCL.cpp:1496] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+terminate called after throwing an instance of 'c10::Error'
+  what():  Trying to free a pointer not allocated here
+Exception raised from raw_delete at /pytorch/torch/csrc/cuda/CUDAPluggableAllocator.cpp:151 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::string) + 0x96 (0x7efe7136c1b6 in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, char const*) + 0x68 (0x7efe71315b3f in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #2: torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator::raw_delete(void*) + 0x1a7 (0x7efe1ce80667 in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: <unknown function> + 0x22b78 (0x7efe717afb78 in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libc10_cuda.so)
+frame #4: <unknown function> + 0x2320e (0x7efe717b020e in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libc10_cuda.so)
+frame #5: <unknown function> + 0x39afa (0x7efe717c6afa in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libc10_cuda.so)
+frame #6: c10::cuda::MemPool::~MemPool() + 0x1b9 (0x7efe717b2329 in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libc10_cuda.so)
+frame #7: <unknown function> + 0xdffa90 (0x7efe64480a90 in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #8: <unknown function> + 0x517be7 (0x7efe63b98be7 in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #9: <unknown function> + 0x5187b1 (0x7efe63b997b1 in /root/work/envs/stalemom/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #10: <unknown function> + 0x235ea9 (0x557db2b29ea9 in /root/work/envs/stalemom/bin/python)
+frame #11: <unknown function> + 0x1d730a (0x557db2acb30a in /root/work/envs/stalemom/bin/python)
+frame #12: <unknown function> + 0x1d7bfa (0x557db2acbbfa in /root/work/envs/stalemom/bin/python)
+frame #13: <unknown function> + 0x235ec4 (0x557db2b29ec4 in /root/work/envs/stalemom/bin/python)
+frame #14: <unknown function> + 0x2a0f23 (0x557db2b94f23 in /root/work/envs/stalemom/bin/python)
+frame #15: <unknown function> + 0x2547aa (0x557db2b487aa in /root/work/envs/stalemom/bin/python)
+frame #16: <unknown function> + 0x1ce458 (0x557db2ac2458 in /root/work/envs/stalemom/bin/python)
+frame #17: <unknown function> + 0x2d273c (0x557db2bc673c in /root/work/envs/stalemom/bin/python)
+frame #18: Py_FinalizeEx + 0x150 (0x557db2bb3660 in /root/work/envs/stalemom/bin/python)
+frame #19: <unknown function> + 0x133c16 (0x557db2a27c16 in /root/work/envs/stalemom/bin/python)
+frame #20: Py_BytesMain + 0x37 (0x557db2b86fe7 in /root/work/envs/stalemom/bin/python)
+frame #21: <unknown function> + 0x29d90 (0x7efe72c30d90 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #22: __libc_start_main + 0x80 (0x7efe72c30e40 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #23: _start + 0x2e (0x557db2b86e6e in /root/work/envs/stalemom/bin/python)
+
